@@ -55,19 +55,19 @@ jobs:
       - name: Sync dependencies
         run: uv sync --frozen --group dev --extra acp
 
-      - name: Focused per-file test lanes (fresh interpreter per file)
+      - name: Focused tests via canonical Hermes runner
         run: |
           set -euo pipefail
-          for f in \
-            tests/hermes_cli/test_pre_inference_route_host.py \
-            tests/hermes_cli/test_autorouter_picker_host.py \
-            tests/hermes_cli/test_resume_model_restore.py \
-            tests/gateway/test_session_mutation_model.py \
-            tests/gateway/test_session_local_route.py \
-            tests/tui_gateway/test_session_resume_db_ownership.py \
-            tests/tui_gateway/test_resume_switched_provider_endpoint.py \
-          ; do
-            echo "::group::$f"
-            uv run --frozen python -m pytest "$f" -q
-            echo "::endgroup::"
-          done
+          # The frozen uv sync above establishes the checkout-specific venv.
+          # run_tests.sh uses the documented HERMES_PYTHON override and supplies
+          # hermetic env filtering, independent file workers and timeout policy.
+          files=(
+            tests/hermes_cli/test_pre_inference_route_host.py
+            tests/hermes_cli/test_autorouter_picker_host.py
+            tests/hermes_cli/test_resume_model_restore.py
+            tests/gateway/test_session_mutation_model.py
+            tests/gateway/test_session_local_route.py
+            tests/tui_gateway/test_session_resume_db_ownership.py
+            tests/tui_gateway/test_resume_switched_provider_endpoint.py
+          )
+          HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh -j 2 "${files[@]}" -q
