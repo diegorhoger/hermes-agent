@@ -138,6 +138,16 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     if room_plumbing or (_row_follows_profile(row) and not composer_profile_matches):
         return {}
     overrides: dict = {}
+    selection = model_config.get("_selection")
+    if isinstance(selection, dict) and str(selection.get("provider", "")).lower() == "autorouter" \
+            and str(selection.get("model", "")).lower() == "auto-free":
+        # Restoring the virtual pick on resume; the build resolves physical via the consumer.
+        overrides.update({
+            "model_override": {"model": "auto-free", "provider": "autorouter",
+                               "base_url": None, "api_mode": None},
+            "provider_override": "autorouter",
+        })
+        return overrides
     model = str(row.get("model") or model_config.get("model") or "").strip()
     # Canonical route reader shared with CLI --resume: nested ``gateway_runtime`` (the route the messaging
     # gateway last ran) before the TUI's top-level keys, then a routable ``billing_provider`` (#125942).
@@ -200,11 +210,16 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     from hermes_cli.runtime_provider_custom import session_provider_identity
     provider = session_provider_identity(attr("provider"), attr("requested_provider"), base_url, model)
     reasoning_config = getattr(agent, "reasoning_config", None)
+    requested = str(getattr(agent, "requested_provider", "") or "").strip().lower()
     live = {
         "model": model, "provider": provider, "base_url": base_url, "api_mode": attr("api_mode"),
         # An empty dict is still a real (present) reasoning config.
         "reasoning_config": reasoning_config if isinstance(reasoning_config, dict) else None,
         "service_tier": getattr(agent, "service_tier", None),
+        # Persist the user's selection separately from the route it resolved to:
+        # resume must re-derive the route (consumer may have rotated), so the
+        # virtual pick, not the physical runtime, round-trips through resume.
+        **({"_selection": {"provider": "autorouter", "model": "auto-free"}} if requested == "autorouter" else {}),
     }
     for key, value in live.items():
         if value or isinstance(value, dict):
