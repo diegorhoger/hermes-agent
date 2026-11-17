@@ -829,11 +829,29 @@ def _invoke_agent(
     # consumer failure aborts the turn with no provider request issued.
     from tui_gateway import autorouter_turn
     autorouter_turn.turn_boundary(sid, session, agent)
+    if getattr(agent, "_autorouter_routed", False):
+        # Ordinary managed sessions: persist only the managed marker (never a
+        # route pick), so resume rebuilds stock and re-resolves the route.
+        # (New rows are INSERTed lazily at the first turn, so this may hit a
+        # missing row; the post-turn persist below covers them.)
+        try:
+            from tui_gateway.agent_factory import _persist_live_session_runtime
+            _persist_live_session_runtime(session)
+        except Exception:
+            logger.debug("failed to persist the managed-routing marker", exc_info=True)
     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
     try:
         from agent.notification_presentation import notification_turn, event_presentation_muted
         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
             st.result = agent.run_conversation(run_message, **st.run_kwargs)
+            if getattr(agent, "_autorouter_routed", False):
+                # Post-turn repair: rows INSERTed lazily during this turn now
+                # get the managed marker (never a route pick) written.
+                try:
+                    from tui_gateway.agent_factory import _persist_live_session_runtime
+                    _persist_live_session_runtime(session)
+                except Exception:
+                    logger.debug("failed to persist the managed-routing marker post-turn", exc_info=True)
             # A held last line that never became a marker is part of the reply: deliver it.
             if hold is not None and (rest := hold.finish()) and not getattr(agent, "_mute_notification_reply", False):
                 _emit_delta(rest)

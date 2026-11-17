@@ -138,6 +138,11 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     if room_plumbing or (_row_follows_profile(row) and not composer_profile_matches):
         return {}
     overrides: dict = {}
+    # AutoRouter-managed ordinary session: never resume a route from billing
+    # accounting. Rebuild stock (config default); the consumer re-resolves the
+    # physical route at every turn boundary.
+    if model_config.get("_autorouter_managed") is True:
+        return {}
     selection = model_config.get("_selection")
     if isinstance(selection, dict) and str(selection.get("provider", "")).lower() == "autorouter" \
             and str(selection.get("model", "")).lower() == "auto-free":
@@ -221,6 +226,27 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     model, base_url = attr("model"), attr("base_url")
     from hermes_cli.runtime_provider_custom import session_provider_identity
     provider = session_provider_identity(attr("provider"), attr("requested_provider"), base_url, model)
+    # AutoRouter-managed ordinary sessions never persist a route pick: resume
+    # must rebuild stock and re-resolve through the consumer at each turn. The
+    # accounting row (model column/billing) may hold an accounting-derived
+    # pair that no ordinary candidate pinned — never resume it as an explicit
+    # pick. The marker alone opts the session back into routing.
+    if getattr(agent, "_autorouter_routed", False):
+        for key in ("model", "provider", "base_url", "api_mode", "gateway_runtime", "_selection"):
+            config.pop(key, None)
+        config["_autorouter_managed"] = True
+        # Reasoning config and service tier still round-trip; the route does not.
+        reasoning_config = getattr(agent, "reasoning_config", None)
+        if isinstance(reasoning_config, dict):
+            config["reasoning_config"] = reasoning_config
+        else:
+            config.pop("reasoning_config", None)
+        service_tier = getattr(agent, "service_tier", None)
+        if isinstance(service_tier, str) and service_tier.strip():
+            config["service_tier"] = service_tier
+        else:
+            config.pop("service_tier", None)
+        return config
     reasoning_config = getattr(agent, "reasoning_config", None)
     requested = str(getattr(agent, "requested_provider", "") or "").strip().lower()
     live = {
@@ -248,14 +274,44 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
 
 def _persist_live_session_runtime(session: dict | None) -> None:
     """Persist active session runtime so future resumes restore the same footer."""
-    live = _live_session_agent_db(session)
+    try:
+        # Resolve the server-namespace helpers through the module object at
+        # call time (keeps monkeypatched fakes authoritative) with the same
+        # silent-skip fallback the bare-injection path used before.
+        from tui_gateway import server as _srv
+
+        live = _srv._live_session_agent_db(session)
+        _persistence_for = _srv._persistence_for
+    except (Exception, AttributeError):
+        agent = (session or {}).get("agent")
+        session_key = str((session or {}).get("session_key") or "").strip()
+        if agent is None or not session_key:
+            return
+        db = getattr(agent, "_session_db", None)
+        if db is None:
+            return
+        live = (agent, session_key, db)
+        _persistence_for = None  # type: ignore[assignment]
     if live is None:
         return
     agent, session_key, db = live
+    import logging
+
+    logger = logging.getLogger(__name__)
     from persistence.conversation.sessions import ReplaceSessionConfig
+    if _persistence_for is None:
+        return
     try:
         with _persistence_for(db) as persistence:
             row = persistence.sessions.get(session_key)
+            if row is None:
+                # The live UI key may not match the durable row id
+                # (e.g. a resumed chat gets a fresh per-process id): fall
+                # back to the agent's own session id, which owns the row.
+                agent_sid = str(getattr(agent, "session_id", "") or "").strip()
+                if agent_sid and agent_sid != session_key:
+                    row = persistence.sessions.get(agent_sid)
+                    session_key = agent_sid
             model_config = _runtime_model_config(agent, row.model_config if row is not None else None)
             if isinstance(composer_profile := session.get("composer_override_profile"), dict):
                 model_config["composer_override_profile"] = composer_profile
