@@ -53,7 +53,7 @@ jobs:
           python-version: '3.14'
 
       - name: Sync dependencies
-        run: uv sync --frozen --group dev
+        run: uv sync --frozen --group dev --extra acp
 
       - name: Focused per-file test lanes (fresh interpreter per file)
         run: |
