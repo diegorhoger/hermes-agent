@@ -461,9 +461,21 @@ def local_session_info(authority, ref):
         source = authority.db.get_session(ref.session_id)['source']
     else:
         source = policy.source if policy else live.source.platform.value
+    _selection_mode = None
+    if policy is not None:
+        try:
+            import json as _json
+            _model_block = (policy.effective(authority, secrets=False)[0].get('model') or {})
+            if isinstance(_model_block, dict) and isinstance(_model_block.get('selection'), dict):
+                if _model_block['selection'].get('mode') == 'autorouter':
+                    _selection_mode = 'autorouter'
+        except Exception:
+            _selection_mode = None
     info = {'source': source,
-            'model': (getattr(agent, 'model', policy.current_model(authority) if policy else None) if agent is not None
-                      else _lazy_model(authority, policy)),
+            **({'selection_mode': _selection_mode} if _selection_mode else {}),
+            'model': 'auto-free' if _selection_mode else (
+                getattr(agent, 'model', policy.current_model(authority) if policy else None) if agent is not None
+                else _lazy_model(authority, policy)),
             'lazy': agent is None,
             'profile_id': authority.profile_id, 'desktop_protocol': CANONICAL_GATEWAY_PROTOCOL,
             # Main's TUI labels a named profile's composer (``alpha ❯``) from this field.

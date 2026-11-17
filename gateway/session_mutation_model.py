@@ -77,6 +77,39 @@ async def prepare_model(authority, live, payload, prepared):
         custom_providers=get_compatible_custom_providers(resolution))
     if not result.success:
         raise RuntimeStoreError('model_resolution_failed')
+    # MODE A: an explicit AutoRouter pick commits the PHYSICAL route the
+    # registered consumer resolved — the virtual identifier never persists as
+    # a usable route, so the ordinary turn construction path is unchanged.
+    # The pinned selection stays discoverable as ``model.selection`` so the
+    # reported/session.info surface can keep showing the routing mode.
+    from dataclasses import replace as _replace
+
+    _autorouter_selection = None
+    try:
+        from hermes_cli.autorouter_picker import (
+            actionable, is_autorouter_pick, resolve_autorouter_physical,
+        )
+        _autorouter_pick = is_autorouter_pick(result.new_model, result.target_provider)
+    except Exception:
+        _autorouter_pick = False
+    if _autorouter_pick:
+        if not actionable():
+            raise RuntimeStoreError('autorouter_unavailable', field='payload.model',
+                                    detail='The AutoRouter selection is not actionable on this host.')
+        _sid = str((prepared.get('snapshot', {}) or {}).get('receipt', {}).get('session_id') or '')
+        _runtime, _receipt = resolve_autorouter_physical(session_id=_sid, platform='gateway')
+        result = _replace(
+            result,
+            new_model=_receipt['model'],
+            target_provider=_receipt['provider'],
+            api_key=_runtime.get('api_key') or '',
+            base_url=_runtime.get('base_url') or '',
+            api_mode=_runtime.get('api_mode') or '',
+            capabilities=None,
+            runtime_capabilities=None,
+            model_info=None,
+        )
+        _autorouter_selection = {"mode": "autorouter", "model": "auto-free"}
     # The configured default is the user's own choice: a reset is never held behind a cost ask.
     refusal = None if reset else await _selection_guard_refusal(
         authority, live, payload, prepared['snapshot'], current, result)
@@ -105,6 +138,10 @@ async def prepare_model(authority, live, payload, prepared):
     # and the endpoint-bound credential fields (inline key, key_env/api_key_env) drop on a route change.
     # Off-loop: the context-pin check can do cold-start disk I/O.
     frozen['model'] = await asyncio.to_thread(apply_model_selection, frozen.get('model'), result)
+    if _autorouter_selection is not None:
+        # The session stays visibly bound to the operator's pick; the routes it
+        # runs are the physical ones resolved by the registered consumer.
+        frozen['model'] = {**(frozen.get('model') or {}), 'selection': dict(_autorouter_selection)}
     if 'reasoning' in payload:
         # The level picked with the model lands in the same commit (as prepare_reasoning writes it).
         from gateway.session_policy import pin_reasoning_effort

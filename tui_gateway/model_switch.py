@@ -272,6 +272,7 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
                 live_api_key = runtime.get("api_key", "")
                 live_base_url = runtime.get("base_url", "")
                 live_api_mode = runtime.get("api_mode", "")
+                live_caps = None  # never reuse virtual-marker capabilities; re-resolve for the physical route
                 logger.info("AutoRouter selection pinned for this session (physical route not logged)")
         except Exception as exc:
             # Never widen: the in-place swap fails, the switch aborts, no provider request is issued.
