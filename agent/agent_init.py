@@ -2124,6 +2124,15 @@ def init_agent(
         base_url = normalize_actual_base_url(base_url)
     agent.base_url = base_url or ""
     provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
+    if provider_name == "autorouter":
+        # The Desktop/TUI construction path rewrites an explicit AutoRouter pick to the
+        # session-consistent physical route BEFORE agent construction. Any other surface
+        # (messaging gateway, ACP, CLI) reaching this point would build a client on the
+        # virtual identifier — refuse instead of sending ``auto-free`` to a provider.
+        raise RuntimeError(
+            "AutoRouter · Auto (Free) (virtual provider 'autorouter') is only constructed by the "
+            "Desktop/TUI model picker path. Select it in the Desktop or TUI model picker, or build "
+            "the agent on a physical provider.")
     agent.provider = provider_name or ""
     agent.requested_provider = (
         requested_provider.strip().lower()

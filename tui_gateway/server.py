@@ -1474,6 +1474,19 @@ def _session_info(agent, session: dict | None = None) -> dict:
     if provider == "custom" and "provider" not in mirror and agent is not None:
         provider = _scoped_session_provider(agent, sess)
     model = pending_model or mirror.get("model", getattr(agent, "model", ""))
+    # AutoRouter selection (session pin names provider=autorouter): the pin is the user-visible
+    # selection; the agent runs the physical route the pin resolved. Report the pin so the pill
+    # keeps showing the routing mode.
+    try:
+        _override = sess.get("model_override") if isinstance(sess, dict) else None
+        if isinstance(_override, dict):
+            from hermes_cli.autorouter_picker import is_autorouter_pick
+
+            if is_autorouter_pick(_override.get("model"), _override.get("provider")):
+                provider = "autorouter"
+                model = "auto-free"
+    except Exception:
+        pass
     # The level the route's entry clamp actually sends (== reasoning_effort when verbatim), so the
     # Desktop can say "ultra sends max on this route" like `/reasoning` does instead of presenting a
     # Hermes-internal step (#61634) as a wire level the route does not have.

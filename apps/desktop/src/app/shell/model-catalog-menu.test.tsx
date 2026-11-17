@@ -873,3 +873,44 @@ describe('the catalog renders per-model pricing', () => {
     expect(screen.queryByText('free')).toBeNull()
   })
 })
+
+// Issue #116: the actionable AutoRouter row renders with the native row styling,
+// selecting it routes through the host switch exactly like any other pick, and the
+// row is absent when the backend does not offer it (unsupported/disabled hosts).
+describe('the AutoRouter virtual row', () => {
+  it('renders "Auto (Free)" under an "AutoRouter" section and calls select with the virtual pick', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          authenticated: true,
+          auth_type: 'virtual',
+          models: ['auto-free'],
+          name: 'AutoRouter',
+          slug: 'autorouter',
+          source: 'virtual',
+          total_models: 1
+        },
+        { models: ['gemini-2.5-flash'], name: 'Google', slug: 'google' }
+      ]
+    })
+
+    const select = renderMenu()
+
+    await screen.findByText('Auto (Free)')
+    expect(screen.getByText('AutoRouter')).toBeDefined()
+    fireEvent.click(screen.getByText('Auto (Free)'))
+    expect(select).toHaveBeenCalledWith('auto-free', 'autorouter')
+  })
+
+  it('hides the AutoRouter row while a non-actionable payload omits it', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [{ models: ['gemini-2.5-flash'], name: 'Google', slug: 'google' }]
+    })
+
+    renderMenu()
+
+    await screen.findByText('Gemini 2.5')
+    expect(screen.queryByText('Auto (Free)')).toBeNull()
+    expect(screen.queryByText('AutoRouter')).toBeNull()
+  })
+})

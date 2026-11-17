@@ -120,6 +120,31 @@ def _validate_moa(req: _Request) -> dict[str, Any]:
         return _reject(f"Could not read MoA presets: {exc}")
 
 
+def _validate_autorouter(req: _Request) -> dict[str, Any]:
+    """Virtual provider ``autorouter`` is selectable only while actionable.
+
+    Same gate as the picker row (raw-config chat-router opt-in + registered
+    consumer). Decides WITHOUT touching the consumer — validation must never
+    claim a routing binding. Zero network either way.
+    """
+    normalized = str(getattr(req, "normalized", "") or "").strip().lower()
+    if normalized != "autorouter":
+        return None  # not ours to decide
+    if req.requested.strip().lower() != "auto-free":
+        return _reject("Unknown AutoRouter model `%s`; the only offered selection is `auto-free`." % req.requested)
+    try:
+        from hermes_cli.autorouter_picker import gate_reason
+    except Exception:
+        return _reject("The AutoRouter selection is not available on this host.")
+    reason = gate_reason()
+    if reason is None:
+        return _accept()
+    return _reject(
+        "AutoRouter · Auto (Free) is not actionable on this host: %s. "
+        "Enable the AutoRouter plugin and its chat router, and install a registered "
+        "routing consumer; stock Hermes never routes this selection." % reason)
+
+
 def _reject_whitespace(req: _Request) -> Optional[dict[str, Any]]:
     # Cloud catalogs never contain spaces. Self-hosted servers and a user-configured
     # base_url do (VLLM "My Custom Model", a local router's "Go reasoning"). The
@@ -765,6 +790,7 @@ def _for(*providers: str) -> Callable[[_Request], bool]:
 # Anthropic Messages → external process → live listing → Bedrock → curated-catalog fallback (always decides).
 _LADDER: tuple[tuple[Callable[[_Request], bool], Callable[[_Request], Optional[dict[str, Any]]]], ...] = (
     (_for("moa"), _validate_moa),
+    (_for("autorouter"), _validate_autorouter),
     (lambda req: True, _reject_whitespace),
     (_is_openrouter_host, _parse_openrouter_preset),
     (_for("lmstudio"), _validate_lmstudio),

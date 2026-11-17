@@ -830,6 +830,63 @@ describe('useModelControls', () => {
     expect(getCurrentModelSource()).toBe('default')
   })
 
+  // ── Stale AutoRouter pick (#116) ───────────────────────────────────────
+  // The AutoRouter row is likewise opt-in: if the catalog no longer offers
+  // it (host unsupported/disabled), the manual pick reseeds from the profile
+  // default instead of pointing at a non-actionable virtual provider.
+  it('reseeds a manual autorouter pick when the catalog no longer carries it (#116)', async () => {
+    const queryClient = new QueryClient()
+    setCurrentModel('auto-free')
+    setCurrentProvider('autorouter')
+    setCurrentModelSource('manual')
+    // Populated catalog without the AutoRouter row: consumer unregistered or disabled.
+    queryClient.setQueryData(modelOptionsQueryKey('default'), {
+      model: 'openai/gpt-5.5',
+      provider: 'openai',
+      providers: [{ models: ['gpt-5.5'], name: 'OpenAI', slug: 'openai' }]
+    })
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai' })
+
+    const { result } = renderHook(() =>
+      useModelControls({
+        queryClient,
+        requestGateway: vi.fn()
+      })
+    )
+
+    await act(() => result.current.refreshCurrentModel())
+
+    expect($currentModel.get()).toBe('openai/gpt-5.5')
+    expect($currentProvider.get()).toBe('openai')
+    expect(getCurrentModelSource()).toBe('default')
+  })
+
+  it('keeps a manual autorouter pick while the catalog still offers the row', async () => {
+    const queryClient = new QueryClient()
+    setCurrentModel('auto-free')
+    setCurrentProvider('autorouter')
+    setCurrentModelSource('manual')
+    queryClient.setQueryData(modelOptionsQueryKey('default'), {
+      model: 'openai/gpt-5.5',
+      provider: 'openai',
+      providers: [{ models: ['auto-free'], name: 'AutoRouter', slug: 'autorouter' }]
+    })
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai' })
+
+    const { result } = renderHook(() =>
+      useModelControls({
+        queryClient,
+        requestGateway: vi.fn()
+      })
+    )
+
+    await act(() => result.current.refreshCurrentModel())
+
+    expect($currentModel.get()).toBe('auto-free')
+    expect($currentProvider.get()).toBe('autorouter')
+    expect(getCurrentModelSource()).toBe('manual')
+  })
+
   it('keeps a manual moa pick while the catalog still offers the preset', async () => {
     const queryClient = new QueryClient()
     setCurrentModel('balanced')

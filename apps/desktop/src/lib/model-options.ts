@@ -59,7 +59,12 @@ export function moaPickRemoved(
   provider: string,
   model: string
 ): boolean {
-  if (!model.trim() || provider.trim().toLowerCase() !== 'moa') {
+  // MoA presets and the AutoRouter virtual row are both opt-in virtual modes:
+  // if the catalog no longer offers them, a manual pick reseeds from the
+  // profile default rather than dangling (#90244, #116).
+  const slug = (provider || '').trim().toLowerCase()
+
+  if (!model.trim() || (slug !== 'moa' && slug !== 'autorouter')) {
     return false
   }
 
@@ -69,7 +74,7 @@ export function moaPickRemoved(
     return false
   }
 
-  const row = providers.find(p => (p.slug || p.name || '').toLowerCase() === 'moa')
+  const row = providers.find(p => (p.slug || p.name || '').toLowerCase() === slug)
 
   return !(row?.models ?? []).includes(model)
 }

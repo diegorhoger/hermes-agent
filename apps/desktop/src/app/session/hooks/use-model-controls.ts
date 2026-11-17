@@ -155,7 +155,8 @@ export function useModelControls({
 
         const pickProvider = () => ($currentProvider.get() || '').trim()
 
-        const staleMoaPick = () => !force && manualPick() && pickProvider().toLowerCase() === 'moa'
+        const staleMoaPick = () =>
+          !force && manualPick() && ['moa', 'autorouter'].includes(pickProvider().toLowerCase())
 
         // A SECOND exception: a bare provider slug can be a stale spelling of a
         // `custom:<key>` profile default (#87035 aliases the two spellings for
@@ -196,7 +197,7 @@ export function useModelControls({
                 requestModelOptions({ profile: catalogProfile, request: requestGateway })
             }))
 
-          reseedStaleMoa = moaPickRemoved(catalog, 'moa', $currentModel.get())
+          reseedStaleMoa = moaPickRemoved(catalog, pickProvider(), $currentModel.get())
 
           if (!reseedStaleMoa) {
             return
@@ -371,7 +372,8 @@ export function useModelControls({
       //    profile default (the cross-session-contamination guard).
       //  - MoA (mixture-of-agents) presets: a transient orchestration choice
       //    that must never become the persisted global gateway default.
-      const isSessionOnlyPreset = (selection.provider || '').toLowerCase() === 'moa'
+      const SESSION_ONLY_PROVIDERS = new Set(['moa', 'autorouter'])
+      const isSessionOnlyPreset = SESSION_ONLY_PROVIDERS.has((selection.provider || '').toLowerCase())
       const scope = touchesPrimary && !isSessionOnlyPreset ? '' : ' --session'
 
       const requestSwitch = (confirmExpensiveModel = false) =>

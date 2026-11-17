@@ -256,11 +256,32 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
     claim is held for the whole commit (the marker writes the chat's transcript), so the idle reaper cannot
     release the lease between the ownership check and the marker."""
     with _transcript_claim(session):
+        # MODE A: an explicit AutoRouter pick commits the live agent on the session-consistent
+        # PHYSICAL route; the persisted/pinned selection stays provider="autorouter" (visibility).
+        live_model, live_provider = result.new_model, result.target_provider
+        live_api_key, live_base_url, live_api_mode, live_caps = (
+            result.api_key, result.base_url, result.api_mode, getattr(result, "runtime_capabilities", None))
+        try:
+            from hermes_cli.autorouter_picker import is_autorouter_pick, resolve_autorouter_physical
+            if is_autorouter_pick(result.new_model, result.target_provider):
+                session_key = (session.get("session_key") or sid) if isinstance(session, dict) else sid
+                runtime, _receipt = resolve_autorouter_physical(
+                    session_id=str(session_key or sid), platform="tui")
+                live_model = _receipt["model"]
+                live_provider = _receipt["provider"]
+                live_api_key = runtime.get("api_key", "")
+                live_base_url = runtime.get("base_url", "")
+                live_api_mode = runtime.get("api_mode", "")
+                logger.info("AutoRouter selection pinned for this session (physical route not logged)")
+        except Exception as exc:
+            # Never widen: the in-place swap fails, the switch aborts, no provider request is issued.
+            logger.warning("AutoRouter selection refused in-place; staying on the current model", exc_info=True)
+            raise RuntimeError(str(exc)) from exc
         try:
             agent.switch_model(
-                new_model=result.new_model, new_provider=result.target_provider, api_key=result.api_key,
-                base_url=result.base_url, api_mode=result.api_mode,
-                capabilities=getattr(result, "runtime_capabilities", None))
+                new_model=live_model, new_provider=live_provider, api_key=live_api_key,
+                base_url=live_base_url, api_mode=live_api_mode,
+                capabilities=live_caps)
         except Exception as exc:
             # The in-place swap rolled the agent back and re-raised. Abort the whole commit (worker
             # restart, persist, marker, override, config write) or the session pins a broken model.

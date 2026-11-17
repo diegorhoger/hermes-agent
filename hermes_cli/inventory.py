@@ -73,6 +73,21 @@ def _without_slug(rows: list[dict], slug: str) -> list[dict]:
 # ─── Public: payload builder ────────────────────────────────────────────
 
 
+def _autorouter_provider_row(current_provider: str = "") -> dict | None:
+    """The virtual ``autorouter`` row; ``None`` unless the mode is actionable.
+
+    Actionable = raw-config opt-in (AutoRouter plugin enabled + its chat
+    router enabled) AND a registered ``pre_inference_route`` consumer on this
+    host. Anything less means the row must not exist. Same gate the validation
+    ladder and the live construction paths apply."""
+    try:
+        from hermes_cli.autorouter_picker import picker_row
+
+        return picker_row(current_provider)
+    except Exception:
+        return None
+
+
 def build_models_payload(
     ctx: ConfigContext, *, explicit_only: bool = False, include_unconfigured: bool = False,
     picker_hints: bool = False, canonical_order: bool = False, pricing: bool = False,
@@ -107,6 +122,10 @@ def build_models_payload(
     moa_row = _moa_provider_row(ctx.current_provider)
     if moa_row is not None:
         rows = [moa_row] + _without_slug(rows, "moa")
+    autorouter_row = _autorouter_provider_row(ctx.current_provider)
+    if autorouter_row is not None:
+        # The AutoRouter row leads alongside MoA; both are opt-in virtual routing modes.
+        rows = [autorouter_row] + _without_slug(rows, "autorouter")
 
     if explicit_only:
         rows = _filter_explicit_provider_rows(rows, ctx)
@@ -779,6 +798,15 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
             # Virtual routing mode, not a configured provider: hide unless current (above) or the user
             # wrote an enabled preset into RAW config (the DEFAULT_CONFIG preset must not show MoA).
             return _raw_config_has_enabled_moa_preset()
+        if slug == "autorouter":
+            # Virtual routing mode, not a configured provider: hide unless current (above) or the
+            # raw-config chat-router opt-in + registered consumer say the row is actionable.
+            try:
+                from hermes_cli.autorouter_picker import actionable
+
+                return actionable()
+            except Exception:
+                return False
         return (
             # Anthropic OAuth (device flow / Claude Code) and external-process CLIs (ACP agents) are
             # deliberate sign-ins that leave no trace in config/env; keep the rows discovery accepted.

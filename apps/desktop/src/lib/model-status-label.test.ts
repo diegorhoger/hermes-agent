@@ -5,7 +5,8 @@ import {
   displayModelName,
   formatModelPillLabel,
   modelDisplayParts,
-  modelVariantTag
+  modelVariantTag,
+  PROVIDER_DISPLAY_NAMES
 } from './model-status-label'
 
 describe('model-status-label', () => {
@@ -146,5 +147,16 @@ describe('model-status-label', () => {
     it('falls back to the store while options are still loading', () => {
       expect(currentPickerSelection(store, undefined)).toEqual(store)
     })
+  })
+})
+
+describe('model-status-label · AutoRouter virtual pick', () => {
+
+  it("renders the AutoRouter virtual selection id as 'Auto (Free)' everywhere", () => {
+    expect(displayModelName('auto-free')).toBe('Auto (Free)')
+    expect(displayModelName('autorouter/auto-free')).toBe('Auto (Free)')
+    expect(formatModelPillLabel('auto-free')).toBe('Auto (Free)')
+    expect(modelDisplayParts('auto-free')).toEqual({ name: 'Auto (Free)', tag: '' })
+    expect(PROVIDER_DISPLAY_NAMES['autorouter']).toBe('AutoRouter')
   })
 })
