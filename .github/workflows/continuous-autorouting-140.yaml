@@ -1,0 +1,99 @@
+name: Dispatch 140 validation (GitHub-hosted)
+
+# Secret-free, validation-only lane for the local/continuous-autorouting-140
+# branch: canonical turn-boundary, replay, gateway and resume checks plus the
+# AutoRouter plugin's suite. Publishes nothing, deploys nothing, bills
+# nothing and reads no credentials. The upstream Blacksmith lanes in ci.yaml
+# are intentionally left untouched.
+
+on:
+  push:
+    branches:
+      - local/continuous-autorouting-140
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: continuous-autorouting-140-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  turn-boundary:
+    name: Turn-boundary, replay and gateway tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      TZ: UTC
+      LANG: C.UTF-8
+      PYTHONHASHSEED: '0'
+      CI: 'true'
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.11.14'
+          python-version: '3.14'
+
+      - name: Sync dependencies
+        run: uv sync --frozen --group dev --extra acp
+
+      - name: Focused tests via canonical Hermes runner
+        run: |
+          set -euo pipefail
+          # HERMES_PYTHON pins the frozen venv for run_tests.sh (hermetic env
+          # filtering, independent file workers and timeout policy).
+          files=(
+            tests/agent/test_no_replay_after_commit.py
+            tests/agent/test_truncation_no_replay_after_commit.py
+            tests/agent/test_replay_boundaries.py
+            tests/gateway/test_autorouter_turn.py
+            tests/tui_gateway/test_autorouter_managed_resume.py
+            tests/tui_gateway/test_resume_switched_provider_endpoint.py
+            tests/tui_gateway/test_custom_provider_session_persistence.py
+            tests/tui_gateway/test_session_resume_db_ownership.py
+            tests/hermes_cli/test_pre_inference_route_host.py
+            tests/hermes_cli/test_autorouter_picker_host.py
+            tests/hermes_cli/test_resume_model_restore.py
+            tests/gateway/test_session_mutation_model.py
+            tests/gateway/test_session_local_route.py
+            tests/gateway/test_api_server_turn_executor.py
+            tests/gateway/test_background_command.py
+          )
+          HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh -j 2 "${files[@]}" -q
+
+  autorouter-integration:
+    name: AutoRouter plugin suite (local provider IDs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: UTC
+      LANG: C.UTF-8
+      PYTHONHASHSEED: '0'
+      CI: 'true'
+    steps:
+      - name: Check out autorouter (local/continuous-autorouting-140)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: diegorhoger/autorouter
+          ref: local/continuous-autorouting-140
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@2b90ead75fb9755d21ba461adc00e5b19b019de99 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check --no-input pytest
+
+      - name: Run the AutoRouter suite
+        run: python -m pytest tests -q
