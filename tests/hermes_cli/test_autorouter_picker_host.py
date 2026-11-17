@@ -510,3 +510,178 @@ def test_unload_of_self_consumer_retires_actionable_state(host, monkeypatch):
     manager.unload("autorouter")
     assert actionable() is False
     assert picker_row() is None
+
+
+# ── persistence of virtual selection separately from the runtime ──────────
+
+def test_runtime_model_config_persists_virtual_selection_separately(host, monkeypatch):
+    import types
+    from tui_gateway.server import _runtime_model_config
+
+    agent = types.SimpleNamespace(
+        model="nvidia/nemotron-free",
+        provider="nvidia",
+        requested_provider="autorouter",
+        base_url="https://integrate.api.nvidia.com/v1/",
+        api_mode="chat_completions",
+        reasoning_config={"enabled": True, "effort": "high"},
+        service_tier="priority",
+    )
+    cfg = _runtime_model_config(agent)
+    assert cfg["_selection"] == {"provider": "autorouter", "model": "auto-free"}
+    assert cfg["model"] == "nvidia/nemotron-free"
+    assert cfg["provider"] == "nvidia"
+
+
+def test_stored_session_runtime_overrides_restores_virtual_pin(host, monkeypatch):
+    import json
+    import types
+    from tui_gateway.server import _stored_session_runtime_overrides
+
+    model_config = {
+        "model": "nvidia/nemotron-free",
+        "provider": "nvidia",
+        "base_url": "https://integrate.api.nvidia.com/v1/",
+        "api_mode": "chat_completions",
+        "_selection": {"provider": "autorouter", "model": "auto-free"},
+    }
+    row = {"model": "nvidia/nemotron-free", "model_config": json.dumps(model_config)}
+    overrides = _stored_session_runtime_overrides(row)
+    assert overrides["model_override"] == {
+        "model": "auto-free", "provider": "autorouter",
+        "base_url": None, "api_mode": None,
+    }
+    assert overrides["provider_override"] == "autorouter"
+    # The physical runtime is NOT rerouted by this restore; the build re-resolves it.
+    assert "model" in overrides["model_override"] and "provider" in overrides["model_override"]
+
+
+# ── physical run-time capabilities on live switch ────────────────────────
+
+def test_switch_into_and_out_of_autorouter_keeps_physical_capabilities(host, monkeypatch):
+    """After switching into AutoRouter the live agent carries the PHYSICAL
+    route's capability metadata — not the virtual marker's."""
+    from hermes_cli.model_switch import parse_model_switch_args
+    import contextlib
+    from unittest.mock import patch
+    from tui_gateway import server
+
+    host(enabled=True, chat_router=True)
+
+    class _Caps(dict):
+        pass
+
+    class _FakeResult:
+        success = True
+        error_message = ""
+        warning_message = ""
+        new_model = "auto-free"
+        target_provider = "autorouter"
+        base_url = "autorouter://local"
+        api_key = "autorouter-virtual-provider"
+        api_mode = "chat_completions"
+        runtime_capabilities = {"native_compaction": True}  # marker caps — must NOT survive
+
+    class _FakeAgent:
+        def __init__(self):
+            self.model = "minimax/m3"
+            self.provider = "minimax"
+            self.base_url = ""
+            self.api_key = ""
+            self.api_mode = ""
+            self.runtime_capabilities = {"native_compaction": True}
+
+        def switch_model(self, **kwargs):
+            self.model = kwargs.get("new_model")
+            self.provider = kwargs.get("new_provider")
+            self.base_url = kwargs.get("base_url", "")
+            self.api_key = kwargs.get("api_key", "")
+            self.api_mode = kwargs.get("api_mode", "")
+            # Mirror the real host: when capabilities are passed explicitly they are
+            # published; when None, the destination provider's own resolution applies.
+            if kwargs.get("capabilities") is not None:
+                self.runtime_capabilities = kwargs["capabilities"]
+            else:
+                self.runtime_capabilities = {"native_compaction": self.provider == "openai"}
+
+    session = {"agent": _FakeAgent(), "session_key": "k-1", "model_override": None}
+    with (
+        patch("hermes_cli.model_switch.switch_model", return_value=_FakeResult()),
+        patch("tui_gateway.server._emit"),
+        patch("tui_gateway.server._restart_slash_worker"),
+        patch("tui_gateway.server._session_info", return_value={}),
+        patch("tui_gateway.server._emit_session_info"),
+        patch("tui_gateway.server._transcript_claim", lambda s: contextlib.nullcontext()),
+        patch("tui_gateway.server._persist_live_session_runtime", side_effect=lambda s: None),
+        patch("tui_gateway.server._persist_live_session_system_prompt"),
+        patch("tui_gateway.server._append_model_switch_marker"),
+    ):
+        server._apply_model_switch("sid", session, "auto-free --provider autorouter",
+                                   confirm_expensive_model=True)
+
+    assert session["agent"].provider == "nvidia"   # physical, not the marker
+    assert session["agent"].model == "nvidia/nemotron-free"
+    assert session["agent"].runtime_capabilities.get("native_compaction") is False
+    # The virtual marker's capabilities must not leak through the switch either.
+    assert session["model_override"]["provider"] == "autorouter"
+    assert session["model_override"]["model"] == "auto-free"
+
+
+def test_switch_back_to_physical_from_autorouter(host, monkeypatch):
+    from hermes_cli.model_switch import parse_model_switch_args
+    import contextlib
+    from unittest.mock import patch
+    from tui_gateway import server
+
+    host(enabled=True, chat_router=True)
+
+    class _FakeResult:
+        def __init__(self):
+            self.success = True
+            self.new_model = "gpt-5"
+            self.target_provider = "openai"
+            self.error_message = ""
+            self.warning_message = ""
+            self.base_url = ""
+            self.api_key = "sk-openai-test"
+            self.api_mode = "chat_completions"
+            self.runtime_capabilities = {"native_compaction": True}
+
+    class _FakeAgent:
+        def __init__(self):
+            self.model = "nvidia/nemotron-free"
+            self.provider = "nvidia"
+            self.base_url = "https://integrate.api.nvidia.com/v1"
+            self.api_key = "fixture-key"
+            self.api_mode = "chat_completions"
+            self.runtime_capabilities = {"native_compaction": False}
+
+        def switch_model(self, **kwargs):
+            self.model = kwargs.get("new_model")
+            self.provider = kwargs.get("new_provider")
+            self.base_url = kwargs.get("base_url", "")
+            self.api_key = kwargs.get("api_key", "")
+            self.api_mode = kwargs.get("api_mode", "")
+            self.runtime_capabilities = {
+                "native_compaction": kwargs.get("new_provider") == "openai",
+            }
+
+    session = {"agent": _FakeAgent(), "session_key": "k-2", "model_override": None}
+    with (
+        patch("hermes_cli.model_switch.switch_model", return_value=_FakeResult()),
+        patch("tui_gateway.server._emit"),
+        patch("tui_gateway.server._restart_slash_worker"),
+        patch("tui_gateway.server._session_info", return_value={}),
+        patch("tui_gateway.server._emit_session_info"),
+        patch("tui_gateway.server._transcript_claim", lambda s: contextlib.nullcontext()),
+        patch("tui_gateway.server._persist_live_session_runtime", side_effect=lambda s: None),
+        patch("tui_gateway.server._persist_live_session_system_prompt"),
+        patch("tui_gateway.server._append_model_switch_marker"),
+    ):
+        server._apply_model_switch("sid", session, "gpt-5 --provider openai",
+                                   confirm_expensive_model=True)
+
+    assert session["agent"].provider == "openai"
+    assert session["agent"].model == "gpt-5"
+    assert session["agent"].runtime_capabilities["native_compaction"] is True
+    assert session["model_override"]["provider"] == "openai"
