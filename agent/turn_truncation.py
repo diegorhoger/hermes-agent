@@ -479,6 +479,24 @@ def recover_from_truncation(
         line, user_response, error = _REPETITION_STREAM_CUT
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
         return st.end_turn(user_response, error)
+    if st.is_stub:
+        # The stream ended without a real finish_reason — the provider died mid-answer
+        # with visible content already committed to the user. The host has no positive
+        # evidence any retry is safe here, so the answer is never replayed: the turn
+        # ends as failed with the delivered partial retained.
+        _streamed = getattr(agent, "_current_streamed_assistant_text", "") or ""
+        if isinstance(_streamed, str) and agent._has_content_after_think_block(_streamed):
+            _partial = _streamed.strip()
+            agent._flush_status_buffer()
+            line = ("The provider's connection broke mid-stream — the answer above was "
+                    "delivered but did not finish.")
+            agent._vprint(f"{agent.log_prefix}⚠️  {line}", force=True, diagnostic=True)
+            return st.end_turn(
+                _partial + "\n\n" + line if _partial else line,
+                error="stream_interrupted",
+                failed=True,
+                failure=("stream_interrupted", False),
+            )
     st.window_filled = _prompt_filled_window(agent, response)
     if st.is_stub and getattr(response, "_clean_eof", False):
         _banner = ("Response truncated — server ended the stream without ever sending finish_reason "

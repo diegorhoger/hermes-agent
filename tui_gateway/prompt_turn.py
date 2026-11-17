@@ -823,6 +823,12 @@ def _invoke_agent(
     _title_key = session.get("session_key") or sid
     agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
         "session.title", sid, {"session_id": _k, "title": t})
+    # AutoRouter continuous routing: re-evaluate the physical route at this turn
+    # boundary, before any inference request is made. AutoRouter-managed sessions
+    # keep their selection; only the physical route may change. Fail-closed: a
+    # consumer failure aborts the turn with no provider request issued.
+    from tui_gateway import autorouter_turn
+    autorouter_turn.turn_boundary(sid, session, agent)
     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
     try:
         from agent.notification_presentation import notification_turn, event_presentation_muted

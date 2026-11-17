@@ -80,6 +80,36 @@ def handle_api_error(
     if agent.thinking_callback:
         agent.thinking_callback("")
 
+    # A visible assistant response already committed this turn (text was streamed to
+    # the user). Replaying the request would duplicate user-visible output and
+    # violate the host's own no-replay-after-commit contract, so the turn ends here
+    # with the delivered text as the reply. No classification, no retry, no fallback,
+    # no provider switch mid-turn: a new safe route may be evaluated on the next turn.
+    _streamed_now = getattr(agent, "_current_streamed_assistant_text", "") or ""
+    if isinstance(_streamed_now, str) and agent._has_content_after_think_block(_streamed_now):
+        from agent.turn_recovery import settle_delivered_partial, _failed_turn_result
+        delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
+        if not isinstance(delivered, str):
+            delivered = ""
+        _delivered = delivered.strip() or agent._strip_think_blocks(_streamed_now).strip()
+        _partial_note = (
+            "The provider's connection broke mid-stream — the reply above was "
+            "delivered but did not finish.")
+        _final_response = (_delivered + "\n\n" + _partial_note) if _delivered else _partial_note
+        from gateway.warning_notifications import TerminalFailureText
+        agent._flush_status_buffer()
+        agent._emit_diagnostic_status(TerminalFailureText(
+            "❌ Provider stream interrupted mid-response — the delivered partial is shown above."))
+        agent._persist_session(messages, conversation_history)
+        _summary = agent._summarize_api_error(api_error) if getattr(agent, "_summarize_api_error", None) else str(api_error)
+        result = _failed_turn_result(_final_response, messages, api_call_count, _summary)
+        result.update({
+            "failure_reason": "stream_interrupted",
+            "failure_retryable": False,
+            "partial": True,
+        })
+        return _verdict("return", result)
+
     _recovered, active_system_prompt = recover_before_classification(
         agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
         active_system_prompt=active_system_prompt,

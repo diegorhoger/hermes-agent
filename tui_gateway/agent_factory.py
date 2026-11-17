@@ -848,10 +848,22 @@ def _make_agent(
         # The virtual pick resolves to the session-consistent physical route; the agent is built
         # on it. The operator-visible session pin keeps provider="autorouter" for the composer UI;
         # this local replacement is only what the client constructor sees.
+        _autorouted = True
         model_override, provider_override = autorouter_override
+    elif model_override is not None or provider_override is not None:
+        # Explicit per-session picks are authoritative and never rewritten by
+        # AutoRouter: the consumer does not run, no re-evaluation is armed,
+        # and the pick stands even when the endpoint fails.
+        _autorouted = False
     else:
-        model_override, provider_override = _pre_inference_route_override(
+        _pre = _pre_inference_route_override(
             sid, session_id, key, model_override, provider_override, cfg, platform_override)
+        # The ordinary seam yields a route only when the consumer opted in and
+        # selected a physical model: those agents are AutoRouter-managed and
+        # re-evaluate their route at each turn boundary. A consumer refusal
+        # raises before any provider request is constructed.
+        _autorouted = _pre[0] is not None or _pre[1] is not None
+        model_override, provider_override = _pre
     model, runtime = _resolve_agent_model_runtime(model_override, provider_override)
     fallback_notice = runtime.pop("_fallback_notice", None)
     _pr = _load_provider_routing()
@@ -890,6 +902,8 @@ def _make_agent(
         # The resolved provider's request body (a custom entry's extra_body), as the CLI/cron/gateway pass it.
         request_overrides=runtime.get("request_overrides"),
         prefill_messages=_load_prefill_messages() or None, **_agent_cbs(sid))
+    if _autorouted:
+        agent._autorouter_routed = True
     if context_cwd_is_launch_artifact is None:
         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)
     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)
