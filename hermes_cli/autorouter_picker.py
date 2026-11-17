@@ -1,30 +1,32 @@
 """Virtual provider ``autorouter`` — ``AutoRouter · Auto (Free)`` (issue #116).
 
 An opt-in, host-sanctioned routing *mode*, not a provider-served model. The
-``auto-free`` selection never reaches a provider: construction of the live
-client always resolves an *eligible physical* provider/model through the
-registered ``pre_inference_route`` consumer (AutoRouter's
-``autorouter/auto-free`` resolver or a compatible consumer) and refuses —
-before any provider request — when the consumer, the host seam or an eligible
-route is missing.
+``auto-free`` selection never reaches a provider: client construction always
+resolves an *eligible physical* provider/model through the registered
+``pre_inference_route`` consumer (AutoRouter's resolver or a compatible
+consumer) and refuses — before any provider request — when the consumer, the
+host seam or an eligible route is missing.
 
 Layer contract:
 
-* picker row: injected only when raw config says the operator enabled the
-  AutoRouter plugin *and* its chat router *and* a consumer is registered on
-  this host. Otherwise the row is absent — never a decorative, non-actionable
-  item. No adapter, no registration, no row.
+* picker row: injected only when (a) raw config says the operator enabled the
+  AutoRouter plugin *and* its chat router, (b) the host supports the seam,
+  and (c) THE AutoRouter plugin itself registered the ``pre_inference_route``
+  middleware (ownership-checked via the plugin manager's registry ledger).
+  Anything less means the row does not exist — never a decorative,
+  non-actionable item.
 * validation (switch pipeline): accepts ``auto-free`` under the same gate;
-  never touches the consumer (a validator with side effects would bind rows
-  to request time). Everything else is deterministically refused.
+  never touches the consumer. Everything else is deterministically refused.
 * runtime resolution for the switch credential step: a credential-free marker
   runtime (like MoA's) so the persisted pin never carries live material.
-* live client construction / in-place switch / resume: the three call sites
-  resolve the PHYSICAL route through the consumer with session binding, build
-  on it, and refuse before any provider request when it cannot.
+* live client construction / in-place switch / resume / provider resolution:
+  the three call sites resolve the PHYSICAL route through the consumer with
+  session binding, build on it, and refuse before any provider request when
+  it cannot.
 
-``explicit_model`` pins that name a physical provider are never rewritten.
-``autorouter/auto-free``/``auto-free`` never travel on the wire; the provider
+Only the canonical identifiers are recognized: the bare pair
+``(auto-free, autorouter)`` and the wide ``autorouter/auto-free`` provider.
+Explicit physical picks are never rewritten. The provider
 ``autorouter://local`` marker exists only inside this host. Fail closed
 everywhere; an unsupported host surfaces a deterministic refusal.
 """
@@ -41,6 +43,9 @@ DISPLAY_NAME = "AutoRouter"
 PLACEHOLDER_KEY = "autorouter-virtual-provider"
 MODELS = (VIRTUAL_MODEL,)
 
+# Plugin identity this host pins for the AutoRouter consumer: the plugin must
+# be LOADED and must OWN the middleware it registered.
+AUTO_ROUTER_PLUGIN_ID = "autorouter"
 
 def _bounded(value: Any, limit: int) -> str:
     text = str(value if value is not None else "")
@@ -64,15 +69,56 @@ def _raw_settings() -> dict[str, Any]:
     return settings if isinstance(settings, dict) else {}
 
 
+def _profile_name() -> str:
+    """Profile-scoped profile name (multiplexed gateway/cron/fork): never the launch profile."""
+    try:
+        from hermes_cli import profiles
+
+        name = profiles.current_profile_name()
+        if isinstance(name, str) and name:
+            return _bounded(name, 128)
+    except Exception:
+        pass
+    return "default"
+
+
 def _consumer_registered() -> bool:
+    """True iff the *AutoRouter* plugin owns a currently-registered consumer.
+
+    ``has_middleware`` proves only that *some* middleware is registered; the
+    ownership ledger is the host's own record of which plugin registered
+    what, so an unrelated consumer never satisfies the gate. After unload the
+    ledger no longer carries the registration and the gate fails closed.
+    """
     try:
         from hermes_cli.middleware import (
             PRE_INFERENCE_ROUTE_MIDDLEWARE,
             apply_pre_inference_route_middleware,  # noqa: F401  (presence is the contract)
         )
-        from hermes_cli.plugins import has_middleware
+        from hermes_cli.plugins import get_plugin_manager, has_middleware
 
-        return bool(has_middleware(PRE_INFERENCE_ROUTE_MIDDLEWARE))
+        if not has_middleware(PRE_INFERENCE_ROUTE_MIDDLEWARE):
+            return False
+        manager = get_plugin_manager()
+        ledger = getattr(manager, "_ownership_ledger", None)
+        if not isinstance(ledger, dict):
+            return False
+        aliases = (
+            AUTO_ROUTER_PLUGIN_ID,
+            f"user/{AUTO_ROUTER_PLUGIN_ID}",
+            f"bundled/{AUTO_ROUTER_PLUGIN_ID}",
+            f"standalone/{AUTO_ROUTER_PLUGIN_ID}",
+        )
+        for key in aliases:
+            entries = ledger.get(key)
+            if not entries:
+                continue
+            for entry in entries:
+                if (getattr(entry, "active", False)
+                        and getattr(entry, "kind", None) == "middleware"
+                        and getattr(entry, "key", None) == PRE_INFERENCE_ROUTE_MIDDLEWARE):
+                    return True
+        return False
     except Exception:
         return False
 
@@ -85,7 +131,7 @@ def gate_reason() -> Optional[str]:
     if settings.get("enable_chat_router") is not True:
         return "the AutoRouter chat router is not enabled"
     if not _consumer_registered():
-        return "no routing consumer is registered on this host"
+        return "no AutoRouter consumer is registered on this host"
     return None
 
 
@@ -115,14 +161,16 @@ def picker_row(current_provider: str = "") -> Optional[dict[str, Any]]:
 
 
 def is_autorouter_pick(model: Any, provider: Any) -> bool:
-    """True when a (model, provider) pair names the virtual AutoRouter pick."""
+    """True exactly for the documented virtual picks; False for everything else.
+
+    Accepts only (``auto-free``, ``autorouter``) and (``autorouter/auto-free``,
+    ``autorouter`` / no provider). Arbitrary ``…/auto-free`` suffixes, missing
+    slugs or mismatched providers are rejected, never interpreted.
+    """
     p = str(provider or "").strip().lower()
     m = str(model or "").strip().lower()
-    if p == VIRTUAL_PROVIDER and m.split("/", 1)[-1] == VIRTUAL_MODEL:
-        # Only the documented virtual pick; any other id under this slug names no route.
+    if p == VIRTUAL_PROVIDER and m == VIRTUAL_MODEL:
         return True
-    # Wide form is accepted only for the virtual provider itself (or no provider):
-    # nvidia/<virtual path> is a mismatch, not an AutoRouter selection.
     if m == WIDE_VIRTUAL_MODEL and p in ("", VIRTUAL_PROVIDER):
         return True
     return False
@@ -146,9 +194,13 @@ def virtual_marker_runtime(requested_provider: Optional[str] = None) -> dict[str
 
 
 def resolve_autorouter_physical(
-    *, session_id: Optional[str], platform: str = "tui",
+    *, session_id: str, platform: str = "tui",
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Resolve the virtual pick to a physical runtime; fail closed.
+
+    ``session_id`` is required: the consumer's binding semantics only make
+    sense bound to one session. Passing ``sid`` from the caller keeps binding
+    aligned with the session that the user is actually in.
 
     Returns ``(runtime, receipt)`` where ``runtime`` is the physical provider's
     own resolved runtime and ``receipt`` carries no credential material.
@@ -156,12 +208,15 @@ def resolve_autorouter_physical(
     """
     from hermes_cli.middleware import apply_pre_inference_route_middleware
 
+    sid = _bounded(session_id, 256)
+    if not sid:
+        raise RuntimeError(
+            "AutoRouter selection refused before any provider request: no stable session binding")
     platform_hint = _bounded(platform, 64) or "tui"
     metadata = {
-        "session_id": _bounded(session_id, 256),
+        "session_id": sid,
         "platform": platform_hint,
-        "hermes_profile": _bounded(
-            os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_ACTIVE_PROFILE") or "default", 128),
+        "hermes_profile": _profile_name(),
         "requested_model": VIRTUAL_MODEL,
         "requested_provider": VIRTUAL_PROVIDER,
         "explicit_model": True,
@@ -193,5 +248,5 @@ def resolve_autorouter_physical(
         raise RuntimeError(
             f"AutoRouter selection resolved a provider that is not usable on this host: {exc}") from exc
     receipt = {"provider": route.provider.strip().lower(), "model": route.model.strip(),
-               "session_id": _bounded(session_id, 256)}
+               "session_id": sid}
     return runtime, receipt

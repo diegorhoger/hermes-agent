@@ -61,7 +61,7 @@ def _config(home, *, enabled, chat_router, native=False):
     }
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text(
-        "plugins:\n  enabled: [autorouter_fixture]\n"
+        "plugins:\n  enabled: [autorouter]\n"
         "  entries:\n    autorouter:\n      settings:\n"
         + "".join(f"        {k}: {str(v).lower()}\n" for k, v in settings.items())
     )
@@ -70,7 +70,7 @@ def _config(home, *, enabled, chat_router, native=False):
 @pytest.fixture
 def host(tmp_path, monkeypatch):
     home = tmp_path / "home"
-    _write_plugin(home, "autorouter_fixture", _CONSUMER)
+    _write_plugin(home, "autorouter", _CONSUMER)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("FIXTURE_OUTCOME", "route")
     monkeypatch.setenv("NVIDIA_API_KEY", "fixture-key")
@@ -453,3 +453,60 @@ def test_session_info_reports_virtual_selection(host, monkeypatch, tmp_path):
     info = server._session_info(agent, session)
     assert info["provider"] == "autorouter"
     assert info["model"] == "auto-free"
+
+
+# ── Other plugins' consumers do not count as the AutoRouter consumer ─────────
+
+def _write_fixture_plugin(home, name, source):
+    target = home / "plugins" / name
+    if target.exists():
+        import shutil
+        shutil.rmtree(target)
+    _write_plugin(home, name, source)
+
+
+def _load_host(home, monkeypatch):
+    manager = PluginManager()
+    manager.discover_and_load()
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    return manager
+
+
+def test_foreign_plugin_consumer_does_not_unlock_picker(tmp_path, monkeypatch):
+    # Plugin "other-routing" registers a pre_inference_route consumer; the
+    # AutoRouter plugin (with its own consumer) is NOT installed. The row must
+    # not render actionable even though *a* consumer exists.
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "plugins").mkdir(exist_ok=True)
+    _write_plugin(home, "other-routing", _CONSUMER)
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled: [other-routing]\n"
+        "  entries:\n    autorouter:\n      settings:\n"
+        "        enabled: true\n        enable_chat_router: true\n        providers: ['nvidia']\n")
+    _load_manager(home, monkeypatch)
+    assert actionable() is False
+    assert picker_row() is None
+    reason = gate_reason() or ""
+    assert "consumer" in reason
+
+
+def _load_manager(home, monkeypatch):
+    manager = PluginManager()
+    manager.discover_and_load()
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    return manager
+
+
+def test_unload_of_self_consumer_retires_actionable_state(host, monkeypatch):
+    home = host(enabled=True, chat_router=True)
+    """After the AutoRouter plugin's consumer registration is disposed, the
+    picker must fall back to the absent state — never a stale actionable row."""
+    assert picker_row() is not None
+    manager = _load_host(home, monkeypatch)
+    loaded = manager._plugins.get("autorouter")
+    assert loaded is not None
+    manager.unload("autorouter")
+    assert actionable() is False
+    assert picker_row() is None
