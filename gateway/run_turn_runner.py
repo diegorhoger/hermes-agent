@@ -178,6 +178,11 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, 
     from hermes_cli.runtime_provider_custom import LocalRuntimeUnavailableError
     from persistence.core.errors import AuthorityRefusal
     auth_permanent = FailoverReason.auth_permanent.value
+    from gateway.autorouter_turn import AutoRouterRefusal
+    if isinstance(exc, AutoRouterRefusal):
+        # The message is already bounded/scrubbed at construction; the reason is the
+        # routing consumer's own verdict, safe to show, and actionable with /retry or /model.
+        return f"⚠️ {exc}", "autorouter_refused", False
     if isinstance(exc, LocalRuntimeUnavailableError):
         # The chosen model is configured; its local server is down. Not a credential verdict, so
         # the client must not offer "Update API key" or sign-in: the sentence names the fix.
@@ -1400,6 +1405,23 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             model, runtime_kwargs = runner._resolve_session_agent_runtime(
                 source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
             )
+            # AutoRouter continuous routing, at the turn boundary: re-resolve the route
+            # before any provider request of this turn. Explicit physical picks are
+            # untouched; managed/virtual picks re-resolve through the sanctioned consumer;
+            # ordinary sessions route only when the operator enabled the consumer. Refusals
+            # raise here — the except path below stamps a failed turn and issues no provider
+            # request.
+            from gateway.autorouter_turn import pre_turn_route
+            model, runtime_kwargs, _autorouter_applied = pre_turn_route(
+                runner=runner, source=ctx.source, session_key=ctx.session_key,
+                user_config=ctx.user_config, model=model, runtime_kwargs=runtime_kwargs,
+            )
+            if _autorouter_applied not in ("stock", "explicit"):
+                logger.info("autorouter turn boundary: session=%s mode=%s",
+                            str(ctx.session_key or "")[:32], _autorouter_applied)
+                # The stock primary's failure fallback (if any) never runs on a rerouted turn:
+                # drop the one-shot notice so it cannot attach to this route's agent.
+                runner._pre_agent_fallback_notice = None
             # Stashed by _resolve_session_agent_runtime when the primary's credentials failed and a
             # fallback was resolved before any agent exists (#74349); one-shot per turn.
             pending_fallback_notice = getattr(runner, "_pre_agent_fallback_notice", None)

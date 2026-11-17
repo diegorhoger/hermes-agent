@@ -221,6 +221,17 @@ class GatewayTurnPrepareMixin:
             self._rehydrate_session_model_override(skey)
         _override_state = self._peek_session_state(skey) if skey else None
         override = _override_state.conversation.model_override if _override_state else None
+        # MODE A — an explicit AutoRouter virtual pick re-resolves to the session-consistent
+        # PHYSICAL route every turn through the sanctioned consumer. The frozen override
+        # (provider="autorouter") is never widened to the stock route on refusal or failure:
+        # the resolution raises, the turn fails closed, and no provider request is issued.
+        if override:
+            from gateway.autorouter_turn import _is_virtual_pick, resolve_virtual_override
+
+            if _is_virtual_pick(override):
+                if record_notice:
+                    self._pre_agent_fallback_notice = None
+                return resolve_virtual_override(runner=self, source=source, session_key=skey, override=override)
         managed_oauth = _session_override_uses_managed_oauth(override)
         if override:
             override_model = override.get("model", model)
