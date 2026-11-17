@@ -36,6 +36,7 @@ export function currentPickerSelection(
  *  `xai-oauth` never reads as the plain `xai` key path, and internal route names
  *  never reach user-facing copy. */
 export const PROVIDER_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+  autorouter: 'AutoRouter',
   anthropic: 'Anthropic Account',
   'claude-code': 'Anthropic OAuth: Required Extra Usage Credits to Use Subscription',
   'minimax-oauth': 'MiniMax',
@@ -180,6 +181,12 @@ function splitTrailingTags(base: string): { base: string; variant: string; quant
  *  tag, so distinct ids (e.g. `…-4.8` vs `…-4.8-fast`) don't collapse. */
 export function modelDisplayParts(model: string): { name: string; tag: string } {
   let { base, variant, quant } = splitTrailingTags(modelBaseId(model))
+
+  // AutoRouter's virtual selection id is a routing mode, not a model-vendor name:
+  // render it as the operator-facing "Auto (Free)" label on every surface.
+  if (base.toLowerCase() === 'auto-free') {
+    return { name: 'Auto (Free)', tag: '' }
+  }
 
   const tags = [variant, quant].filter(Boolean)
 

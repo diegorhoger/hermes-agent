@@ -1155,6 +1155,12 @@ def _resolve_requested_shortcuts(requested_provider, explicit_api_key, explicit_
     if requested_provider == "moa":
         return _runtime("moa", "chat_completions", "moa://local", "moa-virtual-provider", source="moa-virtual-provider",
                         requested_provider=requested_provider)
+    if requested_provider == "autorouter":
+        # Virtual AutoRouter · Auto (Free) pick: a credential-free marker like MoA's.
+        # The live client/CLI never builds on it — the agent factory and the
+        # in-place switch resolve the physical route first and construct on it.
+        from hermes_cli.autorouter_picker import virtual_marker_runtime
+        return virtual_marker_runtime(requested_provider)
     # Azure Anthropic short-circuit: an explicit Azure endpoint with provider="anthropic" must
     # bypass _resolve_named_custom_runtime (which would yield custom/chat_completions/no key).
     eff_base = (explicit_base_url or "").strip()
