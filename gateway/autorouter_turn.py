@@ -195,29 +195,35 @@ def _resolve_physical(*, session_key: str, platform: str) -> tuple[str, dict]:
 
 
 def _validate_managed_marker(value) -> dict | None:
-    """Normalize the persisted managed marker; ``None`` when absent, a dict when present.
+    """Normalize the persisted managed marker.
 
-    A malformed marker is *managed* evidence, not absence — the caller must
-    fail closed on it.
+    Returns ``None`` only when the marker is genuinely *absent* (never written,
+    key missing). Any other present value — booleans, numbers, strings of any
+    kind (including empty), dicts without a known mode, and anything else — is
+    managed evidence: a malformed marker that must fail closed, never a
+    never-managed session.
     """
     if value is None:
         return None
     if isinstance(value, dict):
         mode = str(value.get("mode") or "").strip().lower()
-        return {"mode": mode if mode in _MANAGED_MODES else "ordinary", "malformed": mode not in _MANAGED_MODES}
-    if isinstance(value, str) and value.strip():
-        # A non-dict persisted marker is foreign/corrupt data: managed, fail closed.
+        if mode in _MANAGED_MODES:
+            return {"mode": mode}
         return {"mode": "ordinary", "malformed": True}
-    # Anything else (test doubles' auto-attributes, numbers, bools) carries no claim.
-    return None
+    # Any other present value (bools, numbers, strings of any kind, lists,
+    # foreign objects) is corrupt state: managed evidence, fail closed.
+    return {"mode": "ordinary", "malformed": True}
 
 
 def _read_managed_marker(runner, session_key: str):
     """In-memory conversation marker merged with the persistent store marker.
 
-    Returns ``(marker_or_None, corrupt)``. Raises :class:`AutoRouterRefusal`
-    when the persistent marker cannot be read — an unreadable managed state
-    must never degrade into "never managed".
+    Returns the normalized marker, or ``None`` only when BOTH copies are
+    genuinely absent. Raises :class:`AutoRouterRefusal` when the persistent
+    marker cannot be read — an unreadable managed state must never degrade
+    into "never managed". A valid in-memory marker never conceals a corrupted
+    authoritative persistent state (nor the reverse): a malformed copy anywhere
+    fails closed as managed evidence.
     """
     state = None
     peek = getattr(runner, "_peek_session_state", None)
@@ -241,8 +247,15 @@ def _read_managed_marker(runner, session_key: str):
                 raise AutoRouterRefusal(
                     "AutoRouter routing refused before any provider request: "
                     f"the managed-routing state cannot be read ({_scrub(exc)})") from exc
-    marker = _validate_managed_marker(in_memory) or _validate_managed_marker(stored)
-    return marker
+    in_memory_marker = _validate_managed_marker(in_memory)
+    stored_marker = _validate_managed_marker(stored)
+    markers = [m for m in (in_memory_marker, stored_marker) if m is not None]
+    if any(m.get("malformed") for m in markers):
+        # Corruption anywhere is managed evidence. It must not be concealed by
+        # a valid sibling copy (the persistent store is authoritative and the
+        # in-memory copy may be its poisoned cache).
+        return {"mode": "ordinary", "malformed": True}
+    return markers[0] if markers else None
 
 
 def _persist_managed_marker(runner, session_key: str, mode: str) -> bool:
@@ -417,12 +430,16 @@ def _ordinary_route(*, runner, source, session_key: str, user_config, model, run
         logger.warning("autorouter: physical route %r could not be resolved; refusing", provider, exc_info=True)
         raise AutoRouterRefusal(
             f"AutoRouter routing refused before any provider request: {_scrub(exc)}") from exc
-    resolved_provider = str(
-        physical.get("requested_provider") or physical.get("provider") or "").strip().lower()
-    if resolved_provider and resolved_provider != provider and str(physical.get("provider") or "").strip().lower() != provider:
+    if not isinstance(physical, dict):
         raise AutoRouterRefusal(
-            "AutoRouter routing refused before any provider request: "
-            "the resolved physical route disagrees with the routing decision")
+            "AutoRouter routing refused before any provider request: the physical runtime did not resolve")
+    try:
+        from hermes_cli.autorouter_identity import PhysicalIdentityError, validate_physical_runtime
+
+        validate_physical_runtime(provider=provider, model=routed_model, runtime=physical)
+    except PhysicalIdentityError as exc:
+        raise AutoRouterRefusal(
+            f"AutoRouter routing refused before any provider request: {_scrub(exc)}") from exc
     runtime_kwargs = {**physical, "requested_provider": provider}
     logger.info("autorouter: turn boundary routed session=%s to provider=%s", session_key[:32], provider)
     return routed_model, runtime_kwargs, "ordinary"

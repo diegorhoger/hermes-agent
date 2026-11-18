@@ -98,7 +98,9 @@ def _unload_consumer(monkeypatch, tmp_path):
     return manager
 
 
-def _agent(*, routed=True, virtual=False, provider="locala", model="local-model-a"):
+def _agent(*, routed=True, virtual=False, provider="locala", model="local-model-a",
+           base_url="http://127.0.0.1:9/locala", api_key="sk-canonical-not-the-consumers",
+           api_mode="chat_completions"):
     calls = []
 
     class _Agent:
@@ -109,13 +111,24 @@ def _agent(*, routed=True, virtual=False, provider="locala", model="local-model-
     agent._autorouter_virtual = virtual
     agent.provider = provider
     agent.model = model
-    agent.api_mode = "chat_completions"
+    agent.api_mode = api_mode
+    # A real managed agent carries its full physical runtime; the turn
+    # boundary revalidates it against the canonical resolver.
+    agent.base_url = base_url
+    agent.api_key = api_key
 
     def _switch_model(new_model, new_provider, api_key="", base_url="", api_mode="", capabilities=None):
         calls.append({"new_model": new_model, "new_provider": new_provider,
                       "api_key": api_key, "base_url": base_url, "api_mode": api_mode})
         agent.model = new_model
         agent.provider = new_provider
+        # The real in-place switch rebuilds the client from the supplied runtime.
+        if base_url:
+            agent.base_url = base_url
+        if api_key:
+            agent.api_key = api_key
+        if api_mode:
+            agent.api_mode = api_mode
 
     agent.switch_model = _switch_model
     agent._switch_calls = calls
@@ -251,13 +264,17 @@ def test_both_disabled_matrix(consumer_home, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_physical_model_unchanged_keeps_route_without_swapping(consumer_home, monkeypatch):
+    """Same decision, healthy equivalent runtime: the client is kept — no churn,
+    no second consumer call — but the physical runtime IS revalidated against
+    the canonical resolver before the turn proceeds."""
     _, log = consumer_home
     monkeypatch.setenv("FIXTURE_MODE_A", "route")  # resolves to locala/local-model-a
     seen = _stub_canonical_resolver(monkeypatch)
     agent = _agent(virtual=True, provider="locala", model="local-model-a")
     assert turn_boundary("sess-1", _session(), agent) is False
     assert agent._switch_calls == []
-    assert seen == []  # no credential re-resolution needed for an unchanged route
+    # The unchanged route is revalidated, not re-built and not trusted blindly.
+    assert seen == [{"requested": "locala", "target_model": "local-model-a"}]
     assert len(_consumer_calls(log)) == 1
 
 

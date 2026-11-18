@@ -18,23 +18,29 @@ Routing modes are evaluated **exactly once per decision**:
 
 The validated decision is then resolved to a physical runtime through Hermes'
 canonical resolver (``resolve_runtime_provider``) — never through a second
-consumer call, and never through raw credential reads. The resolved route
-must agree with the decision; anything else fails closed before any provider
-request is issued.
+consumer call, and never through raw credential reads. The resolved runtime
+must be that route (physical-provider identity, endpoint ownership and model
+agreement are verified; see ``hermes_cli.autorouter_identity``).
 
 At each new-turn boundary (before any inference request is made):
 
 * re-resolve the physical route for the agent's own mode (once);
-* keep the current route when it is still the validated decision;
-* otherwise commit the newly resolved physical route in place through the
+* re-resolve and revalidate the physical runtime even when the decision
+  matches the current route — a cached client is not proof the credentials,
+  endpoint or execution configuration are still valid (rotation refreshes
+  them; revocation or an unexplained substitution refuses);
+* keep the current client only when it is physically equivalent to the
+  revalidated runtime (no churn);
+* otherwise commit the (re)resolved physical route in place through the
   agent's own ``switch_model`` (the same in-place swap the TUI ``/model``
   path uses), which rebuilds the provider client atomically and rolls
   back on failure;
 * fail closed before any provider request when the consumer refuses, the
-  physical runtime cannot be resolved, it disagrees with the decision, or
-  the swap itself fails — an AutoRouter failure is never widened into a
-  stock (potentially paid or unknown-cost) request, and never replayed once
-  any output may have committed (nothing runs until after this gate).
+  physical runtime cannot be resolved or revalidated, it is not the
+  validated decision, or the swap itself fails — an AutoRouter failure is
+  never widened into a stock (potentially paid or unknown-cost) request, and
+  never replayed once any output may have committed (nothing runs until
+  after this gate).
 
 An AutoRouter-managed session whose authorization or verified-free evidence
 was revoked fails closed here: the consumer no longer grants the route, so
@@ -89,6 +95,46 @@ def _profile_name() -> str | None:
 
 def read_route(agent) -> tuple[str, str]:
     return (getattr(agent, "provider", "") or "").strip().lower(), getattr(agent, "model", "") or ""
+
+
+def _same_secret(candidate, current) -> bool:
+    """Credential equality without leaking values. Anything we cannot prove
+    equal (callables, mixed types) is treated as *different* so the route is
+    refreshed — never kept on presumed credentials."""
+    if candidate is current:
+        return True
+    if isinstance(candidate, str) and isinstance(current, str):
+        return candidate == current
+    try:
+        return bool(candidate == current)
+    except Exception:
+        return False
+
+
+def _runtime_matches_agent(agent, runtime: dict) -> bool:
+    """True when the resolved runtime is physically equivalent to the client the
+    agent already holds (base_url, api_mode, credential, and — when both sides
+    carry a map — capabilities). Provider/model equality was established by the
+    caller. Anything unverifiable counts as *different*."""
+    try:
+        rt_url = str(runtime.get("base_url") or "").rstrip("/")
+        ag_url = str(getattr(agent, "base_url", "") or "").rstrip("/")
+        if rt_url != ag_url:
+            return False
+        if str(runtime.get("api_mode") or "") != str(getattr(agent, "api_mode", "") or ""):
+            return False
+        if not _same_secret(runtime.get("api_key"), getattr(agent, "api_key", None)):
+            return False
+        rt_caps = runtime.get("capabilities")
+        ag_caps = getattr(agent, "runtime_capabilities", None)
+        # Capability comparison only when BOTH sides carry a non-empty map:
+        # an empty map carries no information and must not force a rebuild.
+        if (isinstance(rt_caps, dict) and isinstance(ag_caps, dict)
+                and rt_caps and ag_caps and rt_caps != ag_caps):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _refusal(reason: str) -> RuntimeError:
@@ -171,10 +217,12 @@ def turn_boundary(sid: str, session: dict, agent) -> bool:
     if not provider or not model:
         raise _refusal("the consumer returned an unusable route")
     current_provider, current_model = read_route(agent)
-    if provider == current_provider and model == current_model:
-        # Still the right route: keep it (no churn). The decision stands on its
-        # own; no credentials are re-resolved and the consumer is not re-invoked.
-        return False
+    decision_matches = current_provider == provider and current_model == model
+    # The runtime lookup happens for EVERY decision — not only when the route
+    # changes. A route that still matches the decision must still hold valid
+    # credentials, endpoint and execution configuration right now; a cached
+    # client is not proof. The lookup is part of validating the one consumer
+    # decision; it is not a second model-selection decision.
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -182,23 +230,23 @@ def turn_boundary(sid: str, session: dict, agent) -> bool:
     except Exception as exc:
         logger.warning("autorouter turn boundary: physical runtime unresolvable; refusing turn",
                        exc_info=True)
+        # Authorization was revoked (or the route cannot be rebuilt): no
+        # request may leave this turn with the obsolete credential.
         raise _refusal(f"the physical runtime for the validated route cannot be resolved: {exc}") from exc
     if not isinstance(runtime, dict):
         raise _refusal("the canonical resolver returned no runtime for the validated route")
-    # The resolved runtime must agree with the validated decision — a fallback
-    # rung that lands somewhere else (denied scope, renamed provider, dead
-    # endpoint) must never be accepted as the route of record.
-    resolved_provider = str(runtime.get("provider") or "").strip().lower()
-    requested_provider = str(runtime.get("requested_provider") or "").strip().lower()
-    if provider not in {resolved_provider, requested_provider}:
-        raise _refusal(
-            f"the resolved physical route ({resolved_provider or 'unknown'}) disagrees with "
-            "the routing decision")
-    runtime_model = str(runtime.get("model") or "").strip()
-    if runtime_model and runtime_model != model:
-        raise _refusal(
-            f"the resolved physical route (model {runtime_model}) disagrees with "
-            "the routing decision")
+    # The resolved runtime must BE the validated decision — an alias adapter
+    # carrying another provider's physical route, another provider's endpoint,
+    # or a different model must never be accepted as the route of record.
+    try:
+        from hermes_cli.autorouter_identity import PhysicalIdentityError, validate_physical_runtime
+
+        validate_physical_runtime(provider=provider, model=model, runtime=runtime)
+    except PhysicalIdentityError as exc:
+        raise _refusal(str(exc)) from exc
+    if decision_matches and _runtime_matches_agent(agent, runtime):
+        # Route still valid and physically equivalent: keep the client (no churn).
+        return False
     logger.info("autorouter turn boundary: switching physical route %s/%s -> %s/%s",
                 current_provider, current_model, provider, model)
     try:

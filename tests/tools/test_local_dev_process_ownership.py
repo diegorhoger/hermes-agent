@@ -252,6 +252,17 @@ def test_synth_provider_at_a_foreign_path_is_never_adopted(scratch):
             proc.kill()
 
 
+def _plugin_source_available() -> bool:
+    return AUTOROUTER_SRC.is_dir()
+
+
+requires_plugin_source = pytest.mark.skipif(
+    not _plugin_source_available(),
+    reason="start-local.sh requires the AutoRouter plugin to load in the isolated profile; "
+           "this host has no plugin source (CI must not fetch private cross-repo sources)")
+
+
+@requires_plugin_source
 def test_stale_pid_file_is_removed_and_startup_proceeds(scratch):
     """A pid that no longer exists: the pid file is stale garbage — removed,
     nothing signalled, startup proceeds and the provider comes up."""
@@ -275,6 +286,7 @@ def test_garbage_pid_file_signals_nothing(scratch, foreign_server):
     assert _pid_alive(foreign_server.pid)
 
 
+@requires_plugin_source
 def test_owned_happy_path_start_then_stop_frees_ports(scratch):
     try:
         start = _run("start-local.sh", scratch.env)
