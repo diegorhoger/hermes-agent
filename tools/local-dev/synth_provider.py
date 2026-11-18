@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Synthetic OpenAI-compatible provider for the isolated AutoRouter dev environment (not production)."""
-import http.server, json, os, sys, time, hashlib
+import http.server, json, os, sys, time, hmac
 
 LOGDIR = os.environ.get("PROVIDER_LOG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "runtime", "provider-logs"))
 os.makedirs(LOGDIR, exist_ok=True)
@@ -15,6 +15,23 @@ def mode():
         return open(MODE_FILE, encoding="utf-8").read().strip() or "ok"
     except Exception:
         return "ok"
+
+
+def fixture_account_label(authorization: str) -> str:
+    """Recognize ONLY fixed local fixture tokens, never persist or hash credentials.
+
+    This is a loopback test helper, not a real credential identity producer.
+    Any non-fixture Authorization header is reduced to 'unrecognized'.
+    """
+    synthetic_tokens = (
+        ("alpha", "sk-isolation-alpha-not-a-secret"),
+        ("beta", "sk-isolation-beta-not-a-secret"),
+    )
+    for label, token in synthetic_tokens:
+        if (hmac.compare_digest(authorization, "Bearer " + token)
+                or hmac.compare_digest(authorization, token)):
+            return label
+    return "unrecognized"
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -54,9 +71,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             self._log({"event": "request", "model": req.get("model"), "stream": bool(req.get("stream")), "mode": m,
                       "body": raw[:300].decode("utf-8", "replace") if not req.get("stream") else None,
-                      # Dispatch 145 isolation runs: fingerprint of the presented credential,
-                      # never the credential itself — binds wire traffic to a synthetic account.
-                      "auth_fp": hashlib.sha256((self.headers.get("Authorization") or "").encode()).hexdigest()[:12]})
+                      # Isolated test fixture identity only: never record or hash bearer tokens.
+                      "auth_account": fixture_account_label(self.headers.get("Authorization") or "")})
             if m == "ratelimit":
                 body = b'{"error": {"message": "rate limited"}}'
                 self.send_response(429)
