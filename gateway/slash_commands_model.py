@@ -214,11 +214,14 @@ class GatewayModelCommandsMixin:
     ) -> Optional[str]:
         """Persist a committed switch: session DB, next-turn note, config write-through, override map.
 
-        Returns the warning for a ``--global`` switch whose ``config.yaml`` write or stale-override
-        cleanup failed (the switch then stays a session override), else ``None``.
+        Returns a warning for any durable write that failed (``config.yaml`` on a ``--global``
+        switch, the stale-override cleanup, the session write-through, the managed-routing
+        marker reconciliation, or the sessions-row model column); ``None`` when every durable
+        write landed. A caller-visible switch confirmation must never conceal such a failure.
         """
         from hermes_cli.model_switch import format_model_for_display
 
+        durability_warnings: list[str] = []
         # Persist the new model to the session DB so the dashboard shows the updated model (#34850).
         _store = getattr(self, "persistence", None)
         if _store is not None:  # so the dashboard shows the updated model
@@ -234,7 +237,10 @@ class GatewayModelCommandsMixin:
                     base_url=result.base_url, api_mode=result.api_mode,
                 )
             except Exception as exc:
-                logger.debug("Failed to persist model switch to DB: %s", exc)
+                logger.warning("Failed to persist model switch to DB: %s", exc, exc_info=True)
+                durability_warnings.append(
+                    f"the sessions row could not be updated to the new model "
+                    f"({exc or type(exc).__name__})")
         # Prepended to the next user message (no system messages mid-history). Display form strips
         # opaque Palantir RID prefixes; the override map keeps the full ID for the wire.
         if not hasattr(self, "_pending_model_notes"):
@@ -273,6 +279,10 @@ class GatewayModelCommandsMixin:
                 global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
         # Precedence is session > channel_overrides > config.yaml: in a chat with a channel_overrides
         # model/provider the session override must stay, or the next turn runs the channel model.
+        # ``durable_pick`` tracks whether THIS pick is committed on some durable substrate: the
+        # managed-marker reconciliation below is authorized only then — clearing the marker for a
+        # pick that never landed durably would widen a managed session to stock semantics.
+        durable_pick = False
         if ctx.persist_global and global_error is None and self._channel_override_for(source) is None:
             try:
                 await self.async_session_store.set_model_override(ctx.session_key, None)
@@ -282,6 +292,7 @@ class GatewayModelCommandsMixin:
                 global_error = t("gateway.model.err_stale_override", error=e)
             else:
                 self._session_model_overrides.pop(ctx.session_key, None)
+                durable_pick = True
         # Non-secret write-through so the override survives a restart (api_key/api_mode are
         # re-resolved on rehydration); a --once override must NOT outlive a restart.
         # Write-through the non-secret parts (model/provider/base_url) to the session store so the override
@@ -296,9 +307,37 @@ class GatewayModelCommandsMixin:
                 await self.async_session_store.set_model_override(
                     ctx.session_key, self._session_model_overrides[ctx.session_key]
                 )
-            except Exception:
-                logger.debug("Failed to persist session model override", exc_info=True)
+                durable_pick = True
+            except Exception as exc:
+                logger.warning("Failed to persist session model override: %s", exc, exc_info=True)
+                durability_warnings.append(
+                    f"the session override could not be persisted to the session store "
+                    f"({exc or type(exc).__name__}); it will not survive a restart")
+        # An explicit physical-model pick reconciles the AutoRouter managed marker at this commit
+        # boundary — the same boundary that makes the pick itself authoritative. An AutoRouter
+        # virtual pick keeps the marker (it IS the managed binding being re-committed), and a
+        # non-durable pick must not clear it (the pick would leave the session unmanaged with no
+        # committed route on disk). Failures are reported, never concealed: the marker stays
+        # corrupt and the reply says so instead of claiming a clean success.
+        if durable_pick:
+            from gateway.autorouter_turn import _is_virtual_pick, clear_managed_marker_durable
+
+            committed = {"model": result.new_model, "provider": result.target_provider}
+            if not _is_virtual_pick(committed):
+                try:
+                    await asyncio.to_thread(clear_managed_marker_durable, self, ctx.session_key)
+                except Exception as exc:
+                    logger.warning("Failed to durably clear the managed-routing marker: %s", exc,
+                                   exc_info=True)
+                    detail = getattr(exc, "args", [None])
+                    durability_warnings.append(
+                        f"the managed-routing marker could not be durably cleared "
+                        f"({(detail[0] if detail else None) or exc or type(exc).__name__})")
         self._evict_cached_agent(ctx.session_key)  # next turn builds fresh from the override
+        if global_error and durability_warnings:
+            return f"{global_error}; {'; '.join(durability_warnings)}"
+        if durability_warnings:
+            return "; ".join(durability_warnings)
         return global_error
 
     async def _model_switch_confirmation(
@@ -351,10 +390,13 @@ class GatewayModelCommandsMixin:
             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
         if getattr(result, "usage_notice", ""):
             lines.append(f"⚠️ {result.usage_notice}")
-        if ctx.persist_global and global_error is not None:
-            # Never claim a clean global commit the disk did not take (#100314).
+        if global_error is not None:
+            # Never claim a clean commit a durable write did not take (#100314): any durable
+            # failure (config.yaml, stale-override cleanup, session write-through, marker
+            # reconciliation, sessions row) is reported instead of concealed by a success line.
             lines.append(t("gateway.model.warning_prefix", warning=global_error))
-            lines.append(t("gateway.model.session_only_hint"))
+            if ctx.persist_global:
+                lines.append(t("gateway.model.session_only_hint"))
         elif ctx.persist_global:
             lines.append(t("gateway.model.saved_global"))
         elif one_turn:

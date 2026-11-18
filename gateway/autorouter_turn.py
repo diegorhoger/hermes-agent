@@ -35,7 +35,9 @@ consumer disappears, whose authorization is revoked, or whose route evidence
 becomes unusable is refused before any provider request — it is never widened
 to the last pinned route or the stock default. Sessions that were never
 managed keep stock semantics. Explicit per-session physical picks remain
-authoritative regardless of the marker; an explicit pick clears it.
+authoritative regardless of the marker; an explicit pick clears it — durably,
+at the authorized commit boundary (e.g. ``_record_model_switch``), or the
+pick's reply says the clear failed.
 
 Refusals raise :class:`AutoRouterRefusal`, a ``RuntimeError`` the turn
 runner converts into a failed turn with zero provider requests issued. No
@@ -311,24 +313,65 @@ def _persist_managed_marker(runner, session_key: str, mode: str) -> bool:
     return ok
 
 
+def clear_managed_marker_durable(runner, session_key: str) -> None:
+    """Durably forget the managed marker at an *authorized* commit boundary.
+
+    Used when an explicit physical-model selection is committed (e.g. a typed
+    ``/model --session`` on the messaging surface): once the pick itself is
+    durably committed, the marker must not linger — a corrupt or stale marker
+    left behind would leave the session permanently refusing (fail-closed) with
+    no route back except another explicit pick. Clears both copies and raises
+    :class:`AutoRouterRefusal` when the durable copy cannot be cleared: the
+    caller must surface the failure to the user rather than report success.
+
+    The in-memory copy alone never authorizes anything; the persistent store is
+    the authority. Both are cleared here so a restart sees the reconciled state.
+    """
+    key = str(session_key or "").strip()
+    if not key:
+        raise AutoRouterRefusal(
+            "AutoRouter marker reconciliation refused: no session key")
+    state = None
+    peek = getattr(runner, "_peek_session_state", None)
+    if callable(peek):
+        try:
+            state = peek(key)
+        except Exception as exc:
+            raise AutoRouterRefusal(
+                "AutoRouter marker reconciliation refused: the session state "
+                f"cannot be read ({_scrub(exc)})") from exc
+    conversation = getattr(state, "conversation", None) if state is not None else None
+    if conversation is not None:
+        # In-memory only; cannot fail meaningfully and authorizes nothing.
+        try:
+            conversation.autorouter_managed = None
+        except Exception:
+            logger.warning("autorouter: failed to clear in-memory managed marker", exc_info=True)
+    store = getattr(runner, "session_store", None)
+    setter = getattr(store, "set_session_metadata", None) if store is not None else None
+    if not callable(setter):
+        raise AutoRouterRefusal(
+            "AutoRouter marker reconciliation failed: the session store cannot "
+            "durably clear the managed-routing marker")
+    try:
+        result = setter(key, MANAGED_METADATA_KEY, None)
+    except Exception as exc:
+        raise AutoRouterRefusal(
+            "AutoRouter marker reconciliation failed: the managed-routing marker "
+            f"could not be durably cleared ({_scrub(exc)})") from exc
+    if result is False:
+        raise AutoRouterRefusal(
+            "AutoRouter marker reconciliation failed: the managed-routing marker "
+            "clear was not persisted (no session entry)")
+
+
 def _clear_managed_marker(runner, session_key: str) -> None:
     """An explicit per-session physical pick is genuinely the operator's call:
     forget the managed marker (best effort)."""
-    state_fn = getattr(runner, "_peek_session_state", None)
-    if callable(state_fn):
-        try:
-            state = state_fn(session_key)
-            if state is not None and getattr(state, "conversation", None) is not None:
-                state.conversation.autorouter_managed = None
-        except Exception:
-            logger.debug("autorouter: failed to clear in-memory managed marker", exc_info=True)
-    store = getattr(runner, "session_store", None)
-    setter = getattr(store, "set_session_metadata", None) if store is not None else None
-    if callable(setter):
-        try:
-            setter(session_key, MANAGED_METADATA_KEY, None)
-        except Exception:
-            logger.debug("autorouter: failed to clear persisted managed marker", exc_info=True)
+    try:
+        clear_managed_marker_durable(runner, session_key)
+    except AutoRouterRefusal as exc:
+        logger.warning("autorouter: managed marker could not be durably cleared: %s", _scrub(exc))
 
 
 def _policy_selection_mode(runner, source):
