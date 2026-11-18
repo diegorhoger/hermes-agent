@@ -257,10 +257,14 @@ def _read_managed_marker(runner, session_key: str):
     stored_marker = _validate_managed_marker(stored)
     markers = [m for m in (in_memory_marker, stored_marker) if m is not None]
     if any(m.get("malformed") for m in markers):
-        # Corruption anywhere is managed evidence. It must not be concealed by
-        # a valid sibling copy (the persistent store is authoritative and the
-        # in-memory copy may be its poisoned cache).
-        return {"mode": "ordinary", "malformed": True}
+        # A corrupt marker is not an authorization to re-adopt this session.
+        # In particular a freshly eligible MODE B decision cannot overwrite
+        # damaged persistent authority and silently send an inference request.
+        # Only an explicit operator selection may reconcile the stored state.
+        raise AutoRouterRefusal(
+            "AutoRouter routing refused before any provider request: "
+            "the managed-routing marker is corrupt; explicitly select a model "
+            "or re-enable AutoRouter for this session to reconcile it")
     if (in_memory_marker is not None and stored_marker is not None
             and in_memory_marker["mode"] != stored_marker["mode"]):
         # Both copies are individually valid but irreconcilable: which one is
