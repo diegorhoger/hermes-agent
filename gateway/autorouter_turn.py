@@ -146,12 +146,17 @@ def _profile_name() -> str | None:
     return None
 
 
-def _kwargs_from_runtime(runtime: dict, *, requested_provider: str) -> dict:
+def _kwargs_from_runtime(runtime: dict, *, requested_provider: str, provider_label: str) -> dict:
     """Gateway-shaped runtime kwargs for an already-resolved runtime.
 
     The route is resolved through Hermes' own resolver — never through raw
     credential reads — and this only reshapes the result into what the
-    gateway turn machinery consumes.
+    gateway turn machinery consumes. The agent is built with the
+    operator-facing provider identity (``provider_label``), matching the
+    Desktop/TUI turn-boundary switch: provider-facing bookkeeping (health,
+    cooldown, per-attempt attribution) keys on the configured route name,
+    never on the resolved adapter (``custom``), so the plugin's eligibility
+    decisions and its observations agree on one identity.
     """
     from gateway.run import _runtime_agent_kwargs
 
@@ -159,6 +164,7 @@ def _kwargs_from_runtime(runtime: dict, *, requested_provider: str) -> dict:
         raise AutoRouterRefusal("AutoRouter route refused: the physical runtime did not resolve")
     kwargs = {
         **_runtime_agent_kwargs(runtime),
+        "provider": str(provider_label or "").strip().lower(),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
         "capabilities": dict(runtime.get("capabilities") or {}),
         "requested_provider": requested_provider,
@@ -191,7 +197,7 @@ def _resolve_physical(*, session_key: str, platform: str) -> tuple[str, dict]:
     if not model or not provider:
         raise AutoRouterRefusal(
             "AutoRouter routing refused before any provider request: resolved route is incomplete")
-    return model, _kwargs_from_runtime(runtime, requested_provider=VIRTUAL_PROVIDER)
+    return model, _kwargs_from_runtime(runtime, requested_provider=VIRTUAL_PROVIDER, provider_label=provider)
 
 
 def _validate_managed_marker(value) -> dict | None:
@@ -453,7 +459,7 @@ def _ordinary_route(*, runner, source, session_key: str, user_config, model, run
     except PhysicalIdentityError as exc:
         raise AutoRouterRefusal(
             f"AutoRouter routing refused before any provider request: {_scrub(exc)}") from exc
-    runtime_kwargs = {**physical, "requested_provider": provider}
+    runtime_kwargs = _kwargs_from_runtime(physical, requested_provider=provider, provider_label=provider)
     logger.info("autorouter: turn boundary routed session=%s to provider=%s", session_key[:32], provider)
     return routed_model, runtime_kwargs, "ordinary"
 
