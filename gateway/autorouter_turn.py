@@ -82,11 +82,20 @@ def _peek_override(runner, session_key: str):
     return getattr(conversation, "model_override", None) if conversation is not None else None
 
 
+def _is_virtual_pin(provider) -> bool:
+    """The virtual AutoRouter provider is reserved to the consumer; no concrete model
+    is served through it. ``provider == "autorouter"`` IS the virtual pin marker."""
+    return str(provider or "").strip().lower() == VIRTUAL_PROVIDER
+
+
 def _is_virtual_pick(override) -> bool:
+    if not override:
+        return False
+    if _is_virtual_pin(override.get("provider")):
+        return True
     try:
         from hermes_cli.autorouter_picker import is_autorouter_pick
-        return bool(override) and is_autorouter_pick(
-            override.get("model"), override.get("provider"))
+        return bool(is_autorouter_pick(override.get("model"), override.get("provider")))
     except Exception:
         return False
 
@@ -165,6 +174,16 @@ def _policy_selection_mode(runner, source):
         block = (frozen or {}).get("model") if isinstance(frozen, dict) else None
         selection = block.get("selection") if isinstance(block, dict) else None
         mode = selection.get("mode") if isinstance(selection, dict) else None
+        if mode == "autorouter":
+            return "autorouter", frozen
+        # A launch policy may also carry the virtual pin directly: the Desktop
+        # freezes ``provider: autorouter`` with the stock model untouched and no
+        # selection marker. That IS the MODE A pin regardless of the model id.
+        try:
+            if _is_virtual_pin(block.get("provider") if isinstance(block, dict) else None):
+                return "autorouter", frozen
+        except Exception:
+            pass
         return (mode or "frozen"), frozen
     except Exception:
         logger.warning("autorouter: policy selection probe failed; leaving the frozen route alone", exc_info=True)
