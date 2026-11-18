@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Synthetic OpenAI-compatible provider for the isolated AutoRouter dev environment (not production)."""
-import http.server, json, os, sys, time
+import http.server, json, os, sys, time, hashlib
 
 LOGDIR = os.environ.get("PROVIDER_LOG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "runtime", "provider-logs"))
 os.makedirs(LOGDIR, exist_ok=True)
@@ -53,7 +53,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json(400, {"error": {"message": "bad json"}})
                 return
             self._log({"event": "request", "model": req.get("model"), "stream": bool(req.get("stream")), "mode": m,
-                      "body": raw[:300].decode("utf-8", "replace") if not req.get("stream") else None})
+                      "body": raw[:300].decode("utf-8", "replace") if not req.get("stream") else None,
+                      # Dispatch 145 isolation runs: fingerprint of the presented credential,
+                      # never the credential itself — binds wire traffic to a synthetic account.
+                      "auth_fp": hashlib.sha256((self.headers.get("Authorization") or "").encode()).hexdigest()[:12]})
             if m == "ratelimit":
                 body = b'{"error": {"message": "rate limited"}}'
                 self.send_response(429)
