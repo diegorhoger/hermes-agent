@@ -70,6 +70,9 @@ jobs:
             tests/tui_gateway/test_autorouter_managed_roundtrip.py
             tests/gateway/test_autorouter_managed_state.py
             tests/tools/test_local_dev_process_ownership.py
+            tests/gateway/test_autorouter_marker_validation.py
+            tests/hermes_cli/test_autorouter_identity.py
+            tests/tui_gateway/test_autorouter_turn_revalidation.py
           )
           HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh -j 2 "${files[@]}" -q
 
