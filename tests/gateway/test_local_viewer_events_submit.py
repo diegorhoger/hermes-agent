@@ -86,6 +86,10 @@ def _gateway_runner():
     runner._session_db = runner.persistence = runner._prefill_messages = None
     runner._pending_model_notes = runner._pending_skills_reload_notes = {}
     runner.session_store._entries = {}
+    # The real store's get_session_metadata(key, k, default=None) returns
+    # "absent" (default) for never-written markers — the MagicMock must not
+    # imply a present, malformed marker by accident.
+    runner.session_store.get_session_metadata.return_value = None
     runner._pre_agent_fallback_notice = None
     runner._get_system_prompt_for_channel.return_value = None
     runner._resolve_session_agent_runtime.return_value = (
