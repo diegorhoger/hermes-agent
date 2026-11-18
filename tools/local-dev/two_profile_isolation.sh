@@ -10,8 +10,8 @@
 #   sessions           sentinel prompts land only in the owning profile's state.db
 #   routing state      autorouter.db decisions grow only in the owning profile;
 #                      providers referenced match the owning profile's allowlist
-#   credentials        wire log fingerprints (sha256 of the Authorization header,
-#                      never the key) match only the owning account per phase;
+#   credentials        wire records only fixed fixture-account labels (no
+#                      credential values or derived hashes) for each phase;
 #                      neither profile home contains the other's raw key
 #   health evidence    a 429 bench observed by profile1 does not appear in
 #                      profile2's health tables (and vice versa by construction)
@@ -168,7 +168,7 @@ T0="$T0" T_A1="$T_A1" T_A2="$T_A2" T_B1="$T_B1" T_B2="$T_B2" \
 P1="$P1" P2="$P2" ISODIR="$ISODIR" LOGDIR="$LOGDIR" EVIDENCE="$EVIDENCE" \
 P1KEY="$P1KEY" P2KEY="$P2KEY" A_SENTINEL="$A_SENTINEL" B_SENTINEL="$B_SENTINEL" \
 REPO="$REPO" python3 - <<'PY'
-import hashlib, json, os, sqlite3, sys, glob, time
+import json, os, sqlite3, sys, glob, time
 
 env = os.environ
 P1, P2, ISODIR, LOGDIR, EVIDENCE = env["P1"], env["P2"], env["ISODIR"], env["LOGDIR"], env["EVIDENCE"]
@@ -194,31 +194,28 @@ def read_jsonl(path):
         pass
     return [r for r in rows if r.get("ts", 0) >= T0 - 5]
 
-def fp_candidates(key):
-    return {hashlib.sha256(s.encode()).hexdigest()[:12] for s in ("Bearer " + key, key)}
-
-fps = {"alpha": fp_candidates(P1KEY), "beta": fp_candidates(P2KEY)}
 reqs = read_jsonl(LOGDIR + "/locala.jsonl") + read_jsonl(LOGDIR + "/localb.jsonl")
 reqs.sort(key=lambda r: r.get("ts", 0))
 requests = [r for r in reqs if r.get("event") == "request"]
 
-p1_fp = fps["alpha"]
-p2_fp = fps["beta"]
-all_fp = {r.get("auth_fp") for r in requests}
-rec("wire: every provider request carries one of the two synthetic accounts' fingerprints",
-    bool(all_fp) and all_fp <= (fps["alpha"] | fps["beta"]), f"fps={sorted(x for x in all_fp if x)}")
-alpha_hits = [r for r in requests if r.get("auth_fp") in p1_fp]
-beta_hits = [r for r in requests if r.get("auth_fp") in p2_fp]
+# The loopback server recognizes exact, fixed synthetic fixture tokens and logs
+# ONLY 'alpha', 'beta', or 'unrecognized'. It never logs or hashes Authorization.
+accounts = {r.get("auth_account") for r in requests}
+recognized_accounts = {"alpha", "beta"}
+rec("wire: every provider request belongs to a known synthetic fixture account",
+    bool(accounts) and accounts <= recognized_accounts,
+    f"unexpected fixture labels={sorted(str(a) for a in accounts - recognized_accounts)}")
+alpha_hits = [r for r in requests if r.get("auth_account") == "alpha"]
+beta_hits = [r for r in requests if r.get("auth_account") == "beta"]
 rec("wire: profile1 (alpha account) made its provider calls",
     len(alpha_hits) >= 2, f"alpha requests={len(alpha_hits)}")
 rec("wire: profile2 (beta account) made its provider calls",
     len(beta_hits) >= 2, f"beta requests={len(beta_hits)}")
-# Credential isolation means the keys are confined to their owning profile: every
-# alpha-presented request necessarily originated from profile1's gateway (only
-# it holds the alpha key), and every beta request from profile2's. Assert the
-# flows exist and never mix a third identity in.
-rec("wire: no third-party credential fingerprint appears",
-    bool(all_fp) and all_fp <= (fps["alpha"] | fps["beta"]), f"fps={sorted(x for x in all_fp if x)}")
+# Accounts are distinguished using labels recognized ONLY by exact known
+# synthetic fixture tokens. Raw tokens and token-derived hashes are not logged.
+rec("wire: no third-party or unrecognized account label appears",
+    bool(accounts) and accounts <= recognized_accounts,
+    f"unexpected fixture labels={sorted(str(a) for a in accounts - recognized_accounts)}")
 
 # --- raw key cross-contamination --------------------------------------------------
 def grep_tree(root, needle):
@@ -337,7 +334,7 @@ out = {
     "surface": "live messaging gateway (api_server platform), one per isolated profile",
     "hermes_sha": sha,
     "synthetic_accounts": {"profile1": "alpha", "profile2": "beta",
-                           "note": "loopback-only dummy keys; fingerprints are sha256[:12] of the Authorization header"},
+                           "note": "loopback-only fixture tokens; only known synthetic labels are logged, never token hashes"},
     "checks": checks,
     "passed": sum(1 for c in checks if c["ok"]),
     "failed": sum(1 for c in checks if not c["ok"]),
