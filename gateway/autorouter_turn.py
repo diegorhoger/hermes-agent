@@ -255,6 +255,19 @@ def _read_managed_marker(runner, session_key: str):
         # a valid sibling copy (the persistent store is authoritative and the
         # in-memory copy may be its poisoned cache).
         return {"mode": "ordinary", "malformed": True}
+    if (in_memory_marker is not None and stored_marker is not None
+            and in_memory_marker["mode"] != stored_marker["mode"]):
+        # Both copies are individually valid but irreconcilable: which one is
+        # correct cannot be established without guessing, and guessing could
+        # launder a revoked MODE A binding into MODE B stock semantics (or the
+        # reverse). Refuse until an authorized operation — an explicit physical
+        # pick (clears both copies) or a fresh AutoRouter opt-in (persists both
+        # copies consistently) — reconciles them.
+        raise AutoRouterRefusal(
+            "AutoRouter routing refused before any provider request: the in-memory and "
+            "persisted managed-routing markers disagree; they must be reconciled by an "
+            "authorized operation (an explicit physical model pick, or a fresh AutoRouter "
+            "opt-in) before this session can route")
     return markers[0] if markers else None
 
 
@@ -469,7 +482,10 @@ def pre_turn_route(*, runner, source, session_key: str, user_config=None,
     override = _peek_override(runner, skey)
     if override:
         if _is_virtual_pick(override):
-            _persist_managed_marker(runner, skey, "virtual")
+            if not _persist_managed_marker(runner, skey, "virtual"):
+                raise AutoRouterRefusal(
+                    "AutoRouter routing refused before any provider request: "
+                    "the managed-routing state cannot be recorded for this session")
             return model, runtime_kwargs, "virtual"
         # Genuine operator pick: explicit picks are authoritative. Forget any
         # stale managed marker (best effort).
@@ -483,7 +499,10 @@ def pre_turn_route(*, runner, source, session_key: str, user_config=None,
     if mode == "autorouter":
         platform = session_platform(source)
         routed_model, routed_kwargs = _resolve_physical(session_key=skey, platform=platform)
-        _persist_managed_marker(runner, skey, "virtual")
+        if not _persist_managed_marker(runner, skey, "virtual"):
+            raise AutoRouterRefusal(
+                "AutoRouter routing refused before any provider request: "
+                "the managed-routing state cannot be recorded for this session")
         logger.info("autorouter: policy selection re-resolved for session=%s", skey[:32])
         return routed_model, routed_kwargs, "virtual"
     if mode is not None:

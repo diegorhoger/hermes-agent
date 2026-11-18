@@ -17,6 +17,8 @@ import pytest
 from gateway.autorouter_turn import (
     AutoRouterRefusal,
     MANAGED_METADATA_KEY,
+    _clear_managed_marker,
+    _persist_managed_marker,
     _read_managed_marker,
     _validate_managed_marker,
     pre_turn_route,
@@ -223,6 +225,71 @@ def test_corrupt_store_marker_full_turn_issues_zero_provider_requests(consumer_s
         7 if k == MANAGED_METADATA_KEY else default)
     monkeypatch.setenv("FIXTURE_OUTCOME", "passthrough")
     result, rec = _e2e_turn(runner, "chat-corrupt", _HISTORY)
+    assert result["failed"] is True
+    assert result["failure_reason"] == "autorouter_refused"
+    assert rec.built == []
+
+
+# ---------------------------------------------------------------------------
+# Unit: conflicting in-memory / persistent markers refuse until reconciled
+# ---------------------------------------------------------------------------
+
+def test_conflicting_modes_refuse_closed():
+    """Two individually valid markers that disagree on mode are irreconcilable:
+    the turn must refuse before any provider request, in both directions."""
+    for in_memory, stored in (({"mode": "ordinary", "since": 1.0}, {"mode": "virtual", "since": 1.0}),
+                              ({"mode": "virtual", "since": 1.0}, {"mode": "ordinary", "since": 1.0})):
+        runner = _runner_with_markers(in_memory, stored)
+        with pytest.raises(AutoRouterRefusal):
+            _read_managed_marker(runner, "key")
+
+
+def test_conflict_reconciled_by_authorized_persist():
+    """A fresh authorized persist (explicit opt-in) writes both copies
+    consistently; the reconciled session then resolves normally."""
+    runner, states = _fake_runner()
+    store = runner.session_store
+    store.set_session_metadata("key", MANAGED_METADATA_KEY, {"mode": "virtual", "since": 1.0})
+    states.setdefault("key", SimpleNamespace(
+        conversation=SimpleNamespace(model_override=None, autorouter_managed={"mode": "ordinary", "since": 1.0})))
+    with pytest.raises(AutoRouterRefusal):
+        _read_managed_marker(runner, "key")
+    # Authorized reconciliation: an explicit opt-in re-persists a consistent pair.
+    assert _persist_managed_marker(runner, "key", "virtual") is True
+    marker = _read_managed_marker(runner, "key")
+    assert marker is not None and marker["mode"] == "virtual" and "malformed" not in marker
+
+
+def test_conflict_reconciled_by_authorized_clear():
+    """A genuine explicit physical pick clears both copies; the reconciled
+    session is never-managed (stock) again."""
+    runner, states = _fake_runner()
+    store = runner.session_store
+    store.set_session_metadata("key", MANAGED_METADATA_KEY, {"mode": "virtual", "since": 1.0})
+    states.setdefault("key", SimpleNamespace(
+        conversation=SimpleNamespace(model_override=None, autorouter_managed={"mode": "ordinary", "since": 1.0})))
+    _clear_managed_marker(runner, "key")
+    assert _read_managed_marker(runner, "key") is None
+
+
+def test_conflict_refuses_full_turn_with_zero_provider_requests(consumer_session, monkeypatch):
+    """End-to-end through the messaging turn runner: conflicting markers fail
+    the turn closed with zero agents built."""
+    _no_policy(monkeypatch)
+    _stub_runner_kwargs(monkeypatch)
+    from tests.gateway.test_autorouter_turn import _e2e_runner, _e2e_turn, _HISTORY
+
+    runner = _e2e_runner()
+    runner.session_store.get_session_metadata = lambda key, k, default=None: (
+        {"mode": "virtual", "since": 1.0} if k == MANAGED_METADATA_KEY else default)
+
+    # In-memory copy disagrees with the persisted copy.
+    class _State:
+        conversation = SimpleNamespace(model_override=None,
+                                       autorouter_managed={"mode": "ordinary", "since": 1.0})
+
+    runner._peek_session_state = lambda key: _State()
+    result, rec = _e2e_turn(runner, "chat-conflict", _HISTORY)
     assert result["failed"] is True
     assert result["failure_reason"] == "autorouter_refused"
     assert rec.built == []

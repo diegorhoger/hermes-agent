@@ -263,8 +263,13 @@ def test_explicit_virtual_pick_already_resolved_upstream_is_left_alone(consumer_
     # What _resolve_session_agent_runtime returns for a virtual override (MODE A):
     physical = {"provider": "localb", "api_key": "sk-dummy-localb", "base_url": "http://127.0.0.1:9/localb",
                 "api_mode": "chat_completions", "requested_provider": "autorouter"}
-    runner = SimpleNamespace(
-        _peek_session_state=_peek_state({"provider": "autorouter", "model": "auto-free"}))
+    # The host always carries a durable store in production; persistence of the
+    # managed marker is mandatory for the resume path to fail closed.
+    from tests.gateway.test_autorouter_managed_state import _fake_runner
+
+    runner, states = _fake_runner()
+    states["key-7"] = SimpleNamespace(conversation=SimpleNamespace(
+        model_override={"provider": "autorouter", "model": "auto-free"}, autorouter_managed=None))
     model, kwargs, applied = pre_turn_route(
         runner=runner, source=_telegram(), session_key="key-7",
         user_config={}, model="local-model-b", runtime_kwargs=dict(physical))
@@ -429,4 +434,23 @@ def test_full_turn_refusal_constructs_no_agent_and_no_provider_request(
     assert result["failed"] is True
     assert result["failure_reason"] == "autorouter_refused"
     assert rec.built == []
+    assert seen == []
+
+def test_explicit_virtual_pick_with_unrecordable_state_refuses(consumer_session, monkeypatch):
+    """If the managed marker cannot be persisted, the turn refuses — a resumed
+    session would otherwise launder the managed binding into stock semantics."""
+    _no_policy(monkeypatch)
+    seen = _stub_runner_kwargs(monkeypatch)
+    from tests.gateway.test_autorouter_managed_state import _fake_runner
+
+    runner, states = _fake_runner()
+    states["key-7"] = SimpleNamespace(conversation=SimpleNamespace(
+        model_override={"provider": "autorouter", "model": "auto-free"}, autorouter_managed=None))
+    runner.session_store.set_session_metadata = lambda *a, **kw: False
+    physical = {"provider": "localb", "api_key": "sk-dummy-localb", "base_url": "http://127.0.0.1:9/localb",
+                "api_mode": "chat_completions", "requested_provider": "autorouter"}
+    with pytest.raises(AutoRouterRefusal):
+        pre_turn_route(
+            runner=runner, source=_telegram(), session_key="key-7",
+            user_config={}, model="local-model-b", runtime_kwargs=dict(physical))
     assert seen == []
