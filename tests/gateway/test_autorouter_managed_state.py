@@ -206,21 +206,21 @@ def test_managed_session_evidence_ineligible_reselects_eligible_route(consumer_s
 # ---------------------------------------------------------------------------
 
 def test_malformed_managed_marker_routes_fail_closed(consumer_session, monkeypatch):
-    """A malformed marker is managed evidence: a fresh consumer decision re-routes
-    (applied ordinary — never stock), while passthrough/refusal refuse."""
+    """Even an otherwise eligible consumer decision must not re-adopt corrupted authority."""
     _no_policy(monkeypatch)
     seen = _stub_runner_kwargs(monkeypatch)
     runner, _states = _fake_runner()
     runner.session_store.set_session_metadata("key-corrupt", "autorouter_managed", "corrupt!!")
-    _model, _kwargs, applied = pre_turn_route(
-        runner=runner, source=_telegram(), session_key="key-corrupt",
-        user_config={}, model="stock-model", runtime_kwargs=dict(_STOCK_RUNTIME))
-    assert applied == "ordinary"  # consumer authorized a fresh route; NOT stock
-    assert seen == [("locala", "local-model-a")]
+    with pytest.raises(AutoRouterRefusal, match="marker is corrupt"):
+        pre_turn_route(
+            runner=runner, source=_telegram(), session_key="key-corrupt",
+            user_config={}, model="stock-model", runtime_kwargs=dict(_STOCK_RUNTIME))
+    assert seen == []
     monkeypatch.setenv("FIXTURE_OUTCOME", "passthrough")
-    with pytest.raises(AutoRouterRefusal):
+    with pytest.raises(AutoRouterRefusal, match="marker is corrupt"):
         pre_turn_route(runner=runner, source=_telegram(), session_key="key-corrupt",
-                       user_config={}, model="local-model-a", runtime_kwargs=dict(_STOCK_RUNTIME))
+                       user_config={}, model="stock-model", runtime_kwargs=dict(_STOCK_RUNTIME))
+    assert seen == []
 
 
 def test_missing_session_key_refuses(consumer_session, monkeypatch):
