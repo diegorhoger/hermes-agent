@@ -111,21 +111,21 @@ def test_both_copies_absent_is_never_managed():
 
 def test_stored_corrupt_in_memory_absent_refuses_closed():
     runner = _runner_with_markers(_UNSET, 1)
-    marker = _read_managed_marker(runner, "key")
-    assert marker is not None and marker.get("malformed") is True
+    with pytest.raises(AutoRouterRefusal, match="marker is corrupt"):
+        _read_managed_marker(runner, "key")
 
 
 def test_valid_in_memory_does_not_conceal_corrupt_persistent_state():
     """A valid in-memory marker never masks a corrupted authoritative store."""
     runner = _runner_with_markers({"mode": "virtual", "since": 1.0}, False)
-    marker = _read_managed_marker(runner, "key")
-    assert marker is not None and marker.get("malformed") is True
+    with pytest.raises(AutoRouterRefusal, match="marker is corrupt"):
+        _read_managed_marker(runner, "key")
 
 
 def test_corrupt_in_memory_does_not_conceal_valid_persistent_state():
     runner = _runner_with_markers(0, {"mode": "ordinary", "since": 1.0})
-    marker = _read_managed_marker(runner, "key")
-    assert marker is not None and marker.get("malformed") is True
+    with pytest.raises(AutoRouterRefusal, match="marker is corrupt"):
+        _read_managed_marker(runner, "key")
 
 
 def test_both_valid_marker_is_valid():
@@ -182,20 +182,17 @@ def test_corrupt_in_memory_marker_never_managed_fallthrough(consumer_session, mo
     assert seen == []
 
 
-def test_corrupt_store_marker_with_consumer_recovery_routes_fresh_not_stock(consumer_session, monkeypatch):
-    """141 semantics preserved for ALL corrupt values: a corrupt marker is managed
-    evidence; a fresh authorized consumer route is applied (never stock, never the
-    last-pinned route)."""
+def test_corrupt_store_marker_refuses_even_when_consumer_offers_fresh_route(consumer_session, monkeypatch):
+    """A fresh candidate cannot overwrite corrupt managed authority and reach inference."""
     _no_policy(monkeypatch)
     seen = _stub_runner_kwargs(monkeypatch)
     runner, _states = _fake_runner()
     runner.session_store.set_session_metadata("key-fresh", MANAGED_METADATA_KEY, False)
-    model, _kwargs, applied = pre_turn_route(
-        runner=runner, source=_telegram(), session_key="key-fresh",
-        user_config={}, model="stock-model", runtime_kwargs=dict(_STOCK_RUNTIME))
-    assert applied == "ordinary"
-    assert model == "local-model-a"
-    assert seen == [("locala", "local-model-a")]
+    with pytest.raises(AutoRouterRefusal, match="marker is corrupt"):
+        pre_turn_route(
+            runner=runner, source=_telegram(), session_key="key-fresh",
+            user_config={}, model="stock-model", runtime_kwargs=dict(_STOCK_RUNTIME))
+    assert seen == []
 
 
 def test_valid_in_memory_corrupt_store_passthrough_refuses(consumer_session, monkeypatch):
@@ -228,6 +225,22 @@ def test_corrupt_store_marker_full_turn_issues_zero_provider_requests(consumer_s
     assert result["failed"] is True
     assert result["failure_reason"] == "autorouter_refused"
     assert rec.built == []
+
+
+def test_corrupt_store_marker_full_turn_with_eligible_consumer_issues_zero_requests(consumer_session, monkeypatch):
+    """Even when the consumer offers a good route, corrupt authority stops execution."""
+    _no_policy(monkeypatch)
+    seen = _stub_runner_kwargs(monkeypatch)
+    from tests.gateway.test_autorouter_turn import _e2e_runner, _e2e_turn, _HISTORY
+
+    runner = _e2e_runner()
+    runner.session_store.get_session_metadata = lambda key, k, default=None: (
+        False if k == MANAGED_METADATA_KEY else default)
+    result, rec = _e2e_turn(runner, "chat-corrupt-eligible", _HISTORY)
+    assert result["failed"] is True
+    assert result["failure_reason"] == "autorouter_refused"
+    assert rec.built == []
+    assert seen == []
 
 
 # ---------------------------------------------------------------------------
