@@ -272,6 +272,33 @@ def test_explicit_physical_pick_stays_authoritative_and_clears_marker(consumer_s
     assert runner.session_store.get_session_metadata("key-explicit", "autorouter_managed") is None
 
 
+def test_explicit_physical_pick_reconciles_corrupt_managed_marker(consumer_session, monkeypatch):
+    """A corrupt persisted marker is not an authorization block for an explicit
+    operator pick: the pick applies and the corrupt marker is cleared — never
+    re-read as a route."""
+    _no_policy(monkeypatch)
+    _stub_runner_kwargs(monkeypatch)
+    seen = []
+
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        lambda provider, target_model=None, **_kw: seen.append((provider, target_model)))
+    runner, states = _fake_runner()
+    runner.session_store.set_session_metadata("key-corrupt-pick", "autorouter_managed", "corrupt!!")
+    states.setdefault("key-corrupt-pick", SimpleNamespace(
+        conversation=SimpleNamespace(model_override=None, autorouter_managed="corrupt!!")))
+    states["key-corrupt-pick"].conversation.model_override = {"provider": "locala", "model": "local-model-a"}
+    model, kwargs, applied = pre_turn_route(
+        runner=runner, source=_telegram(), session_key="key-corrupt-pick",
+        user_config={}, model="local-model-a", runtime_kwargs=dict(_STOCK_RUNTIME))
+    assert applied == "explicit"
+    assert model == "local-model-a"
+    # Explicit pick does not re-resolve through AutoRouter's consumer; the pinned runtime passes through.
+    assert seen == []
+    assert runner.session_store.get_session_metadata("key-corrupt-pick", "autorouter_managed") is None
+    assert states["key-corrupt-pick"].conversation.autorouter_managed is None
+
+
 # ---------------------------------------------------------------------------
 # Profile isolation
 # ---------------------------------------------------------------------------
