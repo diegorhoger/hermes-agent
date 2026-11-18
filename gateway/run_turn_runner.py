@@ -1431,9 +1431,13 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             resolved_route = route_snapshot(runtime_kwargs)
             from gateway.session_api_turn import prepare_api_runtime
             model, runtime_kwargs = prepare_api_runtime(model, runtime_kwargs)
-            if policy and policy.model and not pending_fallback_notice:
+            if policy and policy.model and not pending_fallback_notice \
+                    and _autorouter_applied != "virtual":
                 # The frozen route's model, unless resolution just fell back: the fallback entry's
-                # model is the one this agent must send (#112600).
+                # model is the one this agent must send (#112600). A turn whose autorouter policy
+                # re-resolved through the consumer must send the RESOLVED physical model — stamping
+                # the frozen selection's model would leak the virtual pin (or a stale slug) onto
+                # the wire, past every resolver this turn went through.
                 from gateway.session_authorities import active_authority
                 model = policy.current_model(active_authority(runner))
             # The classic CLI's `/model --once` / `/moa`: this admission only, nothing persisted.

@@ -105,7 +105,9 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
     if resume_sid := current.get("resume_session_id"):
         kw["session_id"] = resume_sid
     resume_overrides = current.get("resume_runtime_overrides")
-    if isinstance(resume_overrides, dict) and resume_overrides and _overrides_have_routable_provider(resume_overrides):
+    managed = bool(isinstance(resume_overrides, dict) and resume_overrides.get("autorouter_managed"))
+    if isinstance(resume_overrides, dict) and resume_overrides and (
+            managed or _overrides_have_routable_provider(resume_overrides)):
         kw.update(resume_overrides)
     else:
         if override := current.get("model_override"):

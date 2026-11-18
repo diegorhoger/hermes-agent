@@ -69,17 +69,19 @@ def _raw_settings() -> dict[str, Any]:
     return settings if isinstance(settings, dict) else {}
 
 
-def _profile_name() -> str:
-    """Profile-scoped profile name (multiplexed gateway/cron/fork): never the launch profile."""
+def _profile_name() -> str | None:
+    """Profile identity for the bound context (multiplexed gateway/cron/fork).
+
+    Returns ``None`` when it cannot be established — never the launch profile."""
     try:
         from hermes_cli import profiles
 
         name = profiles.current_profile_name()
-        if isinstance(name, str) and name:
+        if isinstance(name, str) and name.strip():
             return _bounded(name, 128)
     except Exception:
         pass
-    return "default"
+    return None
 
 
 def _consumer_registered() -> bool:
@@ -93,7 +95,7 @@ def _consumer_registered() -> bool:
     try:
         from hermes_cli.middleware import (
             PRE_INFERENCE_ROUTE_MIDDLEWARE,
-            apply_pre_inference_route_middleware,  # noqa: F401  (presence is the contract)
+            apply_pre_inference_route_middleware,
         )
         from hermes_cli.plugins import get_plugin_manager, has_middleware
 
@@ -213,10 +215,15 @@ def resolve_autorouter_physical(
         raise RuntimeError(
             "AutoRouter selection refused before any provider request: no stable session binding")
     platform_hint = _bounded(platform, 64) or "tui"
+    profile_hint = _profile_name()
+    if profile_hint is None:
+        raise RuntimeError(
+            "AutoRouter selection refused before any provider request: "
+            "the bound profile for this session cannot be established")
     metadata = {
         "session_id": sid,
         "platform": platform_hint,
-        "hermes_profile": _profile_name(),
+        "hermes_profile": profile_hint,
         "requested_model": VIRTUAL_MODEL,
         "requested_provider": VIRTUAL_PROVIDER,
         "explicit_model": True,

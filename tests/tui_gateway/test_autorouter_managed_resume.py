@@ -52,7 +52,9 @@ def test_stored_session_runtime_overrides_managed_marker_opts_back_into_routing(
     row = {"model": "ornith-1.5:9b", "billing_provider": "locala",
            "billing_base_url": "http://127.0.0.1:8401/v1",
            "model_config": '{"_autorouter_managed": true}'}
-    assert _stored_session_runtime_overrides(row) == {}
+    # The managed marker survives resume so a lost consumer fails closed (no
+    # route resurrected from billing accounting, no stock widening).
+    assert _stored_session_runtime_overrides(row) == {"autorouter_managed": True}
 
 
 def test_stored_session_runtime_overrides_managed_marker_wins_over_stale_pick_keys():
@@ -60,4 +62,4 @@ def test_stored_session_runtime_overrides_managed_marker_wins_over_stale_pick_ke
 
     row = {"model": "ornith-1.5:9b", "billing_provider": "locala",
            "model_config": '{"_autorouter_managed": true, "model": "ornith-1.5:9b", "provider": "locala"}'}
-    assert _stored_session_runtime_overrides(row) == {}
+    assert _stored_session_runtime_overrides(row) == {"autorouter_managed": True}

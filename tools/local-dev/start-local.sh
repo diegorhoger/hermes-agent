@@ -1,10 +1,16 @@
 #!/bin/bash
-# Start the isolated local AutoRouter development environment (dispatch 140).
+# Start the isolated local AutoRouter development environment (dispatch 141).
 #
 # Starts the two synthetic loopback providers (Deterministic, zero cost, zero
-# credentials) with PID files, health-checks them, links the isolated profile,
-# and reports (never modifies) the shared Ollama runtime. Refuses to start
-# when a port is held by an unrecognised process.
+# credentials) with ownership-verified PID files, health-checks them, links
+# the isolated profile, and reports (never modifies) the shared Ollama
+# runtime. Refuses to start when a port is held by an unverified process;
+# never signals a process it cannot verify.
+#
+# A provider is "ours" only when it passes full ownership verification
+# (PID file marker + exact command line under THIS development root +
+# recorded start identity + port-listener match). Unowned command lines that
+# merely resemble a synth provider are never adopted.
 #
 # The shared Ollama service is NOT touched: no restart, no kickstart, no
 # config change. If it is unhealthy, start continues with a DEGRADED verdict.
@@ -20,6 +26,9 @@ RUNTIME="${HERMES_DEV_RUNTIME:-$DEV_ROOT/runtime}"
 LOGDIR="$RUNTIME/provider-logs"
 PIDDIR="$RUNTIME/pids"
 mkdir -p "$LOGDIR" "$PIDDIR"
+
+# shellcheck source=provider-ownership.sh
+. "$HERE/provider-ownership.sh"
 
 say()  { printf '%s\n' "$*"; }
 die()  { printf 'start-local: ERROR: %s\n' "$*" >&2; exit 1; }
@@ -50,51 +59,59 @@ if grep -q 'sk-' "$HOME_DIR/config.yaml" 2>/dev/null && ! grep -q 'dummy' "$HOME
   die "config.yaml contains a non-dummy API key — refusing (this profile is loopback-only)"
 fi
 
-# --- ownership-aware port check ------------------------------------------------
-pid_for_port() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -1; }
-cmdline_of()     { ps -p "$1" -o command= 2>/dev/null || true; }
-
-check_port() {  # $1=port $2=name
-  local port="$1" name="$2" pid_file="$PIDDIR/$2.pid" pid_port
-  pid_port="$(pid_for_port "$port" || true)"
-  if [ -z "$pid_port" ]; then
-    return 0 # free
-  fi
-  if [ -f "$pid_file" ]; then
-    local owner; owner="$(cat "$pid_file" 2>/dev/null || true)"
-    if [ "$owner" = "$pid_port" ] && cmdline_of "$pid_port" | grep -q "synth_provider.py $name $port"; then
-      say "port $port: reusing our $name (pid $pid_port)"
-      return 0
-    fi
-  fi
-  if cmdline_of "$pid_port" | grep -q "synth_provider.py $name $port"; then
-    warn "port $port held by an unowned synth_provider.py (pid $pid_port) — adopting it into $pid_file"
-    printf '%s\n' "$pid_port" > "$pid_file"
+# --- ownership-aware port checks ------------------------------------------------
+# For each provider: verify the pid file (full ownership); verify the port;
+# never adopt or signal anything we cannot verify.
+handle_existing() { # $1=name $2=port $3=model; prints pid to reuse, or empty
+  local name="$1" port="$2" model="$3" pid holder
+  local pid_file="$PIDDIR/$name.pid"
+  local rc=0
+  if pid="$(read_verified_pid_file "$pid_file" "$name" "$port" "$model")"; then
+    printf '%s\n' "$pid"
     return 0
+  else
+    rc=$?
   fi
-  die "port $port is held by an unrecognised process (pid $pid_port): $(cmdline_of "$pid_port") — refusing to touch it"
+  if [ "$rc" = 2 ]; then
+    # The pid file is ours to manage but neither adopt nor signal what it
+    # names: a matching live process that fails verification is foreign or
+    # recycled. Inspect the port; only when it is FREE is the file stale.
+    local holder; holder="$(port_listener_pid "$port" || true)"
+    if [ -n "$holder" ]; then
+      warn "$name: $pid_file fails ownership verification and :$port is held by pid $holder — refusing (foreign process left untouched)"
+      return 3
+    fi
+    warn "$name: $pid_file fails ownership verification but :$port is free — removing the stale pid file (no process signalled)"
+    rm -f "$pid_file"
+  fi
+  printf ''
+  return 0
 }
 
-check_port "$PORT_A" locala
-check_port "$PORT_B" localb
-
-# --- start synthetic providers ---------------------------------------------------
 start_one() { # $1=name $2=port $3=model
-  local name="$1" port="$2" model="$3" pid_file
-  pid_file="$PIDDIR/$name.pid"
-  if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-    say "$name already running (pid $(cat "$pid_file"))"
-    return 0
+  local name="$1" port="$2" model="$3" pid holder
+  local pid_file="$PIDDIR/$name.pid"
+  pid="$(handle_existing "$name" "$port" "$model")" || die "$name: cannot establish ownership of the existing state on :$port — refusing to start"
+  if [ -n "$pid" ]; then
+    if curl -fsS -m 2 "http://127.0.0.1:$port/v1/models" 2>/dev/null | grep -q "$model"; then
+      say "port $port: reusing our verified $name (pid $pid)"
+      return 0
+    fi
+    die "port $port: verified $name pid $pid is not answering a healthy /v1/models — leaving it alone; run stop-local.sh to stop it"
   fi
-  local pid_port; pid_port="$(pid_for_port "$port" || true)"
-  if [ -n "$pid_port" ]; then
-    say "$name already serving on :$port (pid $pid_port)"
-    return 0
+  holder="$(port_listener_pid "$port" || true)"
+  if [ -n "$holder" ]; then
+    die "port $port is held by an unverified process (pid $holder): $(ps_command_of "$holder") — refusing to touch it"
   fi
+  # Spawn, record identity, and publish the pid file with O_EXCL semantics.
   PROVIDER_LOG_DIR="$LOGDIR" nohup python3 "$HERE/synth_provider.py" "$name" "$port" "$model" \
       > "$LOGDIR/$name.stdout.log" 2>&1 &
-  local pid=$!
-  printf '%s\n' "$pid" > "$pid_file"
+  pid=$!
+  if ! write_pid_file "$pid_file" "$pid" "$name" "$port" "$model"; then
+    # Another writer won or the process already died; never overwrite the winner.
+    if kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; fi
+    die "failed to record verified ownership for $name (pid $pid) — refusing to continue (pid file race?)"
+  fi
   say "started $name on :$port (pid $pid, model $model)"
 }
 
@@ -128,7 +145,7 @@ fi
 say "ollama: $ollama"
 
 # --- plugin load check --------------------------------------------------------------
-HERMES_HOME="$HOME_DIR" "$REPO/.venv/bin/python" - <<'PY' || die "AutoRouter plugin failed to load in the isolated profile"
+HERMES_HOME="$HOME_DIR" PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$REPO/.venv/bin/python" - <<'PY' || die "AutoRouter plugin failed to load in the isolated profile"
 import sys
 from hermes_cli.plugins import get_plugin_manager, has_middleware
 from hermes_cli.middleware import PRE_INFERENCE_ROUTE_MIDDLEWARE

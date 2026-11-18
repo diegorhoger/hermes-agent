@@ -263,7 +263,8 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
             result.api_key, result.base_url, result.api_mode, getattr(result, "runtime_capabilities", None))
         try:
             from hermes_cli.autorouter_picker import is_autorouter_pick, resolve_autorouter_physical
-            if is_autorouter_pick(result.new_model, result.target_provider):
+            _autorouter_pick = bool(is_autorouter_pick(result.new_model, result.target_provider))
+            if _autorouter_pick:
                 session_key = (session.get("session_key") or sid) if isinstance(session, dict) else sid
                 runtime, _receipt = resolve_autorouter_physical(
                     session_id=str(session_key or sid), platform="tui")
@@ -293,6 +294,12 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
             logger.warning("In-place model switch failed for TUI agent: %s", exc)
             raise ValueError(f"Model switch to {result.new_model} failed ({exc}); "
                              f"staying on {getattr(agent, 'model', current_model)}.") from exc
+        # The committed selection is now known: an AutoRouter pick manages this
+        # session (MODE A — the virtual selection re-resolves per turn); an
+        # explicit physical pick is genuinely the operator's call and clears
+        # the managed markers so the turn boundary never rewrites it.
+        agent._autorouter_routed = bool(_autorouter_pick)
+        agent._autorouter_virtual = bool(_autorouter_pick)
         _restart_slash_worker(sid, session)
         _persist_live_session_runtime(session)
         _persist_live_session_system_prompt(session)

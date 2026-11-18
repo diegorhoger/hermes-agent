@@ -87,7 +87,10 @@ def _is_routable_provider(provider: str) -> bool:
 
 def _overrides_have_routable_provider(overrides: dict) -> bool:
     """Whether persisted runtime overrides still name a routable provider (renamed/removed → "Unknown
-    provider" at agent init). Empty = NOT routable, so the caller falls back to the session's picked model."""
+    provider" at agent init). Empty = NOT routable, so the caller falls back to the session's picked model.
+    The virtual AutoRouter pick is always resolvable through the consumer; never dropped on resume."""
+    if str(overrides.get("provider_override") or "").strip().lower() == "autorouter":
+        return True
     provider = str(overrides.get("provider_override") or "").strip()
     if not provider:
         provider = str((overrides.get("model_override") or {}).get("provider") or "").strip()
@@ -138,11 +141,19 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     if room_plumbing or (_row_follows_profile(row) and not composer_profile_matches):
         return {}
     overrides: dict = {}
-    # AutoRouter-managed ordinary session: never resume a route from billing
-    # accounting. Rebuild stock (config default); the consumer re-resolves the
-    # physical route at every turn boundary.
+    # AutoRouter-managed session: never resume a route from billing accounting.
+    # A persisted virtual pick (MODE A) comes back as the pick so the build
+    # re-resolves the physical route through the consumer; an ordinary managed
+    # session (MODE B) rebuilds unpinned and the consumer re-evaluates it at
+    # every turn boundary — a lost consumer fails closed there, never wide.
     if model_config.get("_autorouter_managed") is True:
-        return {}
+        mode = str(model_config.get("_autorouter_mode") or "ordinary").strip().lower()
+        if mode == "virtual":
+            return {"model_override": {"model": "auto-free", "provider": "autorouter",
+                                        "base_url": None, "api_mode": None},
+                    "provider_override": "autorouter",
+                    "autorouter_managed": True}
+        return {"autorouter_managed": True}
     selection = model_config.get("_selection")
     if isinstance(selection, dict) and str(selection.get("provider", "")).lower() == "autorouter" \
             and str(selection.get("model", "")).lower() == "auto-free":
@@ -235,6 +246,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         for key in ("model", "provider", "base_url", "api_mode", "gateway_runtime", "_selection"):
             config.pop(key, None)
         config["_autorouter_managed"] = True
+        config["_autorouter_mode"] = "virtual" if getattr(agent, "_autorouter_virtual", False) else "ordinary"
+
         # Reasoning config and service tier still round-trip; the route does not.
         reasoning_config = getattr(agent, "reasoning_config", None)
         if isinstance(reasoning_config, dict):
@@ -247,6 +260,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         else:
             config.pop("service_tier", None)
         return config
+    config.pop("_autorouter_managed", None)
+    config.pop("_autorouter_mode", None)
     reasoning_config = getattr(agent, "reasoning_config", None)
     requested = str(getattr(agent, "requested_provider", "") or "").strip().lower()
     live = {
@@ -797,7 +812,6 @@ def _pre_inference_route_override(sid, session_id, key, model_override, provider
     * ``passthrough`` is the only provable opt-out and proceeds stock.
     """
     import logging
-    import os
 
     log = logging.getLogger(__name__)
     if model_override is not None or provider_override is not None:
@@ -838,11 +852,22 @@ def _pre_inference_route_override(sid, session_id, key, model_override, provider
         platform_hint = _resolve_agent_platform(platform_override) or "tui"
     except Exception:
         platform_hint = "tui"
+    try:
+        from hermes_cli.profiles import current_profile_name
+
+        profile_hint = current_profile_name()
+    except Exception:
+        profile_hint = None
+    if not isinstance(profile_hint, str) or not profile_hint.strip():
+        # Never substitute the launch profile for a bound session: a routing
+        # decision may not be taken against the wrong profile's policy.
+        raise RuntimeError(
+            "AutoRouter pre-inference route refused: the bound profile for this session "
+            "cannot be established")
     metadata = {
         "session_id": _bound(session_key, 256),
         "platform": _bound(platform_hint, 64),
-        "hermes_profile": _bound(
-            os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_ACTIVE_PROFILE") or "default", 128),
+        "hermes_profile": _bound(profile_hint, 128),
         "requested_model": _bound(model_cfg.get("default"), 199),
         "requested_provider": _bound(model_cfg.get("provider"), 64),
         "explicit_model": False,
@@ -880,7 +905,8 @@ def _make_agent(
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
     platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
-    cwd_override: str | None = None, auth_user_id: str | None = None, persistence=None):
+    cwd_override: str | None = None, auth_user_id: str | None = None, persistence=None,
+    autorouter_managed: bool = False):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
@@ -960,6 +986,16 @@ def _make_agent(
         prefill_messages=_load_prefill_messages() or None, **_agent_cbs(sid))
     if _autorouted:
         agent._autorouter_routed = True
+        if autorouter_override is not None:
+            agent._autorouter_virtual = True
+        elif autorouter_managed:
+            agent._autorouter_virtual = False
+    elif autorouter_managed:
+        # Resumed managed session whose consumer is gone: the agent is built
+        # on the config default route but remains AutoRouter-managed — the
+        # turn boundary fails closed before any provider request is issued.
+        agent._autorouter_routed = True
+        agent._autorouter_virtual = False
     if context_cwd_is_launch_artifact is None:
         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)
     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)

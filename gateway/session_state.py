@@ -68,6 +68,10 @@ class ConversationState:
 
     model_override: Optional[dict[str, Any]] = None  # /model per-session override
     one_turn_restore: Optional[dict[str, Any]] = None  # /model --once snapshot
+    # AutoRouter-managed ordinary session marker ({"mode", "since"}). In-memory half of the
+    # persisted routing state (session store metadata mirrors it); gates fail-closed semantics
+    # for a session whose routing authorization was granted at least once.
+    autorouter_managed: Optional[dict[str, Any]] = None
     reasoning_override: Optional[dict[str, Any]] = None  # /reasoning override
     service_tier_override: Any = _UNSET_TIER  # /fast: "priority" or None; _UNSET_TIER = absent
     last_resolved_model: str = ""  # last successfully-resolved non-empty model

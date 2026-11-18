@@ -58,7 +58,7 @@ else
 fi
 
 say "autorouter plugin"
-if HERMES_HOME="$HOME_DIR" "$REPO/.venv/bin/python" - >/tmp/verify-plugin.out 2>/tmp/verify-plugin.err <<'PY'
+if HERMES_HOME="$HOME_DIR" PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$REPO/.venv/bin/python" - >/tmp/verify-plugin.out 2>/tmp/verify-plugin.err <<'PY'
 from hermes_cli.plugins import get_plugin_manager, has_middleware
 from hermes_cli.middleware import PRE_INFERENCE_ROUTE_MIDDLEWARE
 m = get_plugin_manager()

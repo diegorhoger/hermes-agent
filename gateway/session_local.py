@@ -496,8 +496,13 @@ def local_session_info(authority, ref):
         try:
             import json as _json
             _model_block = (policy.effective(authority, secrets=False)[0].get('model') or {})
-            if isinstance(_model_block, dict) and isinstance(_model_block.get('selection'), dict):
-                if _model_block['selection'].get('mode') == 'autorouter':
+            if isinstance(_model_block, dict):
+                selection = _model_block.get('selection')
+                if isinstance(selection, dict) and selection.get('mode') == 'autorouter':
+                    _selection_mode = 'autorouter'
+                elif str(_model_block.get('provider') or '').strip().lower() == 'autorouter':
+                    # The Desktop freezes `provider: autorouter` with the stock model untouched and
+                    # no selection marker — the virtual pin IS the selection regardless of the model id.
                     _selection_mode = 'autorouter'
         except Exception:
             _selection_mode = None

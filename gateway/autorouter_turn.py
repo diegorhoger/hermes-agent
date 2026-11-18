@@ -18,12 +18,24 @@ Modes
 * **MODE B — ordinary session** (no explicit per-session pick). Evaluated
   only when the host's ``pre_inference_route`` consumer is registered (i.e.
   the operator enabled AutoRouter for ordinary sessions). A ``route``
-  decision pins this turn's physical route; ``passthrough`` is the provable
-  opt-out and runs stock; anything else refuses the turn before any provider
-  request.
+  decision pins this turn's physical route; a never-managed session running
+  ``passthrough`` is the provable opt-out and runs stock; anything else
+  refuses the turn before any provider request.
 * **Explicit physical pick** — never rewritten; the consumer does not run.
 * **Policy (following) sessions** — honoured, or re-resolved per turn when
   the frozen selection is ``mode: autorouter``.
+
+Managed routing state
+---------------------
+A session that AutoRouter has routed at least once is *managed*. The marker
+lives in the conversation scope (``SessionState.conversation.autorouter_managed``)
+and in the persistent session-store metadata (``autorouter_managed``), so it
+survives a gateway restart. A session that was previously managed and whose
+consumer disappears, whose authorization is revoked, or whose route evidence
+becomes unusable is refused before any provider request — it is never widened
+to the last pinned route or the stock default. Sessions that were never
+managed keep stock semantics. Explicit per-session physical picks remain
+authoritative regardless of the marker; an explicit pick clears it.
 
 Refusals raise :class:`AutoRouterRefusal`, a ``RuntimeError`` the turn
 runner converts into a failed turn with zero provider requests issued. No
@@ -34,10 +46,13 @@ before the agent is built every turn.
 from __future__ import annotations
 
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 VIRTUAL_PROVIDER = "autorouter"
+MANAGED_METADATA_KEY = "autorouter_managed"
+_MANAGED_MODES = ("ordinary", "virtual")
 
 
 class AutoRouterRefusal(RuntimeError):
@@ -71,14 +86,27 @@ def _scrub(text: object, limit: int = 300) -> str:
 
 
 def _peek_override(runner, session_key: str):
+    """The session's model override, or ``None`` when there is none.
+
+    Raises on a failed state lookup: an unreadable session must never be
+    mistaken for an unpinned ordinary session.
+    """
     peek = getattr(runner, "_peek_session_state", None)
-    if not callable(peek) or not session_key:
-        return None
+    if not callable(peek):
+        raise AutoRouterRefusal(
+            "AutoRouter routing refused before any provider request: "
+            "the session state store cannot be read")
     try:
         state = peek(session_key)
-    except Exception:
-        return None
+    except Exception as exc:
+        raise AutoRouterRefusal(
+            "AutoRouter routing refused before any provider request: "
+            f"the session state cannot be read ({_scrub(exc)})") from exc
     conversation = getattr(state, "conversation", None) if state is not None else None
+    if state is not None and conversation is None:
+        raise AutoRouterRefusal(
+            "AutoRouter routing refused before any provider request: "
+            "the session state is unusable")
     return getattr(conversation, "model_override", None) if conversation is not None else None
 
 
@@ -100,7 +128,13 @@ def _is_virtual_pick(override) -> bool:
         return False
 
 
-def _profile_name() -> str:
+def _profile_name() -> str | None:
+    """The bound profile for this turn, or ``None`` when it cannot be established.
+
+    Never falls back to the process-wide launch profile: under a multiplexed
+    gateway the process environment belongs to the launch profile, and a
+    routing decision (or the credentials it unlocks) may not cross profiles.
+    """
     try:
         from hermes_cli import profiles
 
@@ -108,10 +142,8 @@ def _profile_name() -> str:
         if isinstance(name, str) and name.strip():
             return name.strip()[:128]
     except Exception:
-        pass
-    import os
-
-    return (os.environ.get("HERMES_ACTIVE_PROFILE") or os.environ.get("HERMES_PROFILE") or "default").strip()[:128] or "default"
+        return None
+    return None
 
 
 def _kwargs_from_runtime(runtime: dict, *, requested_provider: str) -> dict:
@@ -142,6 +174,11 @@ def _resolve_physical(*, session_key: str, platform: str) -> tuple[str, dict]:
     """Resolve an explicit virtual pick to (model, runtime_kwargs); fail closed."""
     from hermes_cli.autorouter_picker import resolve_autorouter_physical
 
+    profile = _profile_name()
+    if profile is None:
+        raise AutoRouterRefusal(
+            "AutoRouter routing refused before any provider request: "
+            "the bound profile for this session cannot be established")
     try:
         runtime, receipt = resolve_autorouter_physical(session_id=session_key, platform=platform)
     except Exception as exc:
@@ -155,6 +192,107 @@ def _resolve_physical(*, session_key: str, platform: str) -> tuple[str, dict]:
         raise AutoRouterRefusal(
             "AutoRouter routing refused before any provider request: resolved route is incomplete")
     return model, _kwargs_from_runtime(runtime, requested_provider=VIRTUAL_PROVIDER)
+
+
+def _validate_managed_marker(value) -> dict | None:
+    """Normalize the persisted managed marker; ``None`` when absent, a dict when present.
+
+    A malformed marker is *managed* evidence, not absence — the caller must
+    fail closed on it.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        mode = str(value.get("mode") or "").strip().lower()
+        return {"mode": mode if mode in _MANAGED_MODES else "ordinary", "malformed": mode not in _MANAGED_MODES}
+    if isinstance(value, str) and value.strip():
+        # A non-dict persisted marker is foreign/corrupt data: managed, fail closed.
+        return {"mode": "ordinary", "malformed": True}
+    # Anything else (test doubles' auto-attributes, numbers, bools) carries no claim.
+    return None
+
+
+def _read_managed_marker(runner, session_key: str):
+    """In-memory conversation marker merged with the persistent store marker.
+
+    Returns ``(marker_or_None, corrupt)``. Raises :class:`AutoRouterRefusal`
+    when the persistent marker cannot be read — an unreadable managed state
+    must never degrade into "never managed".
+    """
+    state = None
+    peek = getattr(runner, "_peek_session_state", None)
+    if callable(peek):
+        try:
+            state = peek(session_key)
+        except Exception as exc:
+            raise AutoRouterRefusal(
+                "AutoRouter routing refused before any provider request: "
+                f"the session state cannot be read ({_scrub(exc)})") from exc
+    in_memory = getattr(getattr(state, "conversation", None), "autorouter_managed", None) \
+        if state is not None else None
+    stored = None
+    store = getattr(runner, "session_store", None)
+    if store is not None:
+        getter = getattr(store, "get_session_metadata", None)
+        if callable(getter):
+            try:
+                stored = getter(session_key, MANAGED_METADATA_KEY)
+            except Exception as exc:
+                raise AutoRouterRefusal(
+                    "AutoRouter routing refused before any provider request: "
+                    f"the managed-routing state cannot be read ({_scrub(exc)})") from exc
+    marker = _validate_managed_marker(in_memory) or _validate_managed_marker(stored)
+    return marker
+
+
+def _persist_managed_marker(runner, session_key: str, mode: str) -> bool:
+    """Record that this session is AutoRouter-managed; True on success.
+
+    When the marker cannot be persisted the caller cannot distinguish a
+    restart from a never-managed session, so MODE B callers must fail closed.
+    """
+    mode = mode if mode in _MANAGED_MODES else "ordinary"
+    marker = {"mode": mode, "since": time.time()}
+    ok = True
+    state_fn = getattr(runner, "_session_state", None)
+    if callable(state_fn):
+        try:
+            conversation = state_fn(session_key).conversation
+            conversation.autorouter_managed = marker
+        except Exception:
+            ok = False
+    store = getattr(runner, "session_store", None)
+    setter = getattr(store, "set_session_metadata", None) if store is not None else None
+    if callable(setter):
+        try:
+            result = setter(session_key, MANAGED_METADATA_KEY, marker)
+            if result is False:
+                ok = False
+        except Exception:
+            ok = False
+    else:
+        ok = False
+    return ok
+
+
+def _clear_managed_marker(runner, session_key: str) -> None:
+    """An explicit per-session physical pick is genuinely the operator's call:
+    forget the managed marker (best effort)."""
+    state_fn = getattr(runner, "_peek_session_state", None)
+    if callable(state_fn):
+        try:
+            state = state_fn(session_key)
+            if state is not None and getattr(state, "conversation", None) is not None:
+                state.conversation.autorouter_managed = None
+        except Exception:
+            logger.debug("autorouter: failed to clear in-memory managed marker", exc_info=True)
+    store = getattr(runner, "session_store", None)
+    setter = getattr(store, "set_session_metadata", None) if store is not None else None
+    if callable(setter):
+        try:
+            setter(session_key, MANAGED_METADATA_KEY, None)
+        except Exception:
+            logger.debug("autorouter: failed to clear persisted managed marker", exc_info=True)
 
 
 def _policy_selection_mode(runner, source):
@@ -190,13 +328,14 @@ def _policy_selection_mode(runner, source):
         return "frozen", None
 
 
-def _ordinary_route(*, runner, source, session_key: str, user_config, model, runtime_kwargs):
+def _ordinary_route(*, runner, source, session_key: str, user_config, model, runtime_kwargs,
+                    managed: bool):
     """MODE B: evaluate the ordinary session at the turn boundary.
 
     Returns (model, runtime_kwargs, applied). ``applied`` is ``stock`` for the
-    provable opt-out (passthrough or no consumer), ``ordinary`` for a freshly
-    resolved route. Raises :class:`AutoRouterRefusal` before any provider
-    request on refusal.
+    provable opt-out (passthrough or no consumer — never-managed sessions
+    only), ``ordinary`` for a freshly resolved route. Raises
+    :class:`AutoRouterRefusal` before any provider request otherwise.
     """
     try:
         from hermes_cli.middleware import (
@@ -213,7 +352,18 @@ def _ordinary_route(*, runner, source, session_key: str, user_config, model, run
             f"AutoRouter routing refused before any provider request: capability probe failed ({_scrub(exc)})"
         ) from exc
     if not registered:
+        if managed:
+            raise AutoRouterRefusal(
+                "AutoRouter routing refused before any provider request: "
+                "the session is AutoRouter-managed but the routing consumer is no "
+                "longer registered on this host")
         return model, runtime_kwargs, "stock"
+
+    profile = _profile_name()
+    if profile is None:
+        raise AutoRouterRefusal(
+            "AutoRouter routing refused before any provider request: "
+            "the bound profile for this session cannot be established")
 
     platform = session_platform(source)
     cfg = user_config if isinstance(user_config, dict) else {}
@@ -221,7 +371,7 @@ def _ordinary_route(*, runner, source, session_key: str, user_config, model, run
     metadata = {
         "session_id": session_key[:256],
         "platform": platform[:64],
-        "hermes_profile": _profile_name(),
+        "hermes_profile": profile,
         "requested_model": str(model_cfg.get("default") or model or "")[:199],
         "requested_provider": str(runtime_kwargs.get("provider") or model_cfg.get("provider") or "")[:64],
         "explicit_model": False,
@@ -241,6 +391,14 @@ def _ordinary_route(*, runner, source, session_key: str, user_config, model, run
             "the registered consumer returned no usable decision")
     status = getattr(route, "status", None)
     if status == "passthrough":
+        if managed:
+            # A managed session has no provable opt-out: keeping the pinned
+            # route or falling back to the stock default would launder
+            # revoked authorization.
+            raise AutoRouterRefusal(
+                "AutoRouter routing refused before any provider request: "
+                "the session is AutoRouter-managed and the consumer declined to "
+                "route this turn (passthrough)")
         # Provable opt-out: proceed exactly as if no consumer existed.
         return model, runtime_kwargs, "stock"
     if status != "route":
@@ -259,6 +417,12 @@ def _ordinary_route(*, runner, source, session_key: str, user_config, model, run
         logger.warning("autorouter: physical route %r could not be resolved; refusing", provider, exc_info=True)
         raise AutoRouterRefusal(
             f"AutoRouter routing refused before any provider request: {_scrub(exc)}") from exc
+    resolved_provider = str(
+        physical.get("requested_provider") or physical.get("provider") or "").strip().lower()
+    if resolved_provider and resolved_provider != provider and str(physical.get("provider") or "").strip().lower() != provider:
+        raise AutoRouterRefusal(
+            "AutoRouter routing refused before any provider request: "
+            "the resolved physical route disagrees with the routing decision")
     runtime_kwargs = {**physical, "requested_provider": provider}
     logger.info("autorouter: turn boundary routed session=%s to provider=%s", session_key[:32], provider)
     return routed_model, runtime_kwargs, "ordinary"
@@ -277,7 +441,10 @@ def pre_turn_route(*, runner, source, session_key: str, user_config=None,
     """
     skey = str(session_key or "").strip()
     if not skey:
-        return model, runtime_kwargs, "stock"
+        # The session cannot be located, so its managed state cannot be
+        # established — stock inference would launder it. Refuse.
+        raise AutoRouterRefusal(
+            "AutoRouter routing refused before any provider request: no session key")
 
     # Explicit per-session selections first: physical picks untouched; an
     # explicit *virtual* pick was already re-resolved this turn inside
@@ -285,7 +452,11 @@ def pre_turn_route(*, runner, source, session_key: str, user_config=None,
     override = _peek_override(runner, skey)
     if override:
         if _is_virtual_pick(override):
+            _persist_managed_marker(runner, skey, "virtual")
             return model, runtime_kwargs, "virtual"
+        # Genuine operator pick: explicit picks are authoritative. Forget any
+        # stale managed marker (best effort).
+        _clear_managed_marker(runner, skey)
         return model, runtime_kwargs, "explicit"
 
     # Following (launch-policy) sessions: the frozen route stands unless the
@@ -295,16 +466,26 @@ def pre_turn_route(*, runner, source, session_key: str, user_config=None,
     if mode == "autorouter":
         platform = session_platform(source)
         routed_model, routed_kwargs = _resolve_physical(session_key=skey, platform=platform)
+        _persist_managed_marker(runner, skey, "virtual")
         logger.info("autorouter: policy selection re-resolved for session=%s", skey[:32])
         return routed_model, routed_kwargs, "virtual"
     if mode is not None:
         # A policy session with any other frozen selection: untouched.
         return model, runtime_kwargs, "explicit"
 
-    # MODE B — ordinary sessions.
-    return _ordinary_route(
+    # MODE B — ordinary sessions. Managed-ness decides whether the absence of
+    # a provable route is stock semantics or a fail-closed refusal.
+    managed = _read_managed_marker(runner, skey) is not None
+    routed_model, routed_kwargs, applied = _ordinary_route(
         runner=runner, source=source, session_key=skey,
-        user_config=user_config, model=model, runtime_kwargs=runtime_kwargs)
+        user_config=user_config, model=model, runtime_kwargs=runtime_kwargs,
+        managed=managed)
+    if applied == "ordinary":
+        if not _persist_managed_marker(runner, skey, "ordinary"):
+            raise AutoRouterRefusal(
+                "AutoRouter routing refused before any provider request: "
+                "the managed-routing state cannot be recorded for this session")
+    return routed_model, routed_kwargs, applied
 
 
 def resolve_virtual_override(*, runner, source, session_key: str, override):

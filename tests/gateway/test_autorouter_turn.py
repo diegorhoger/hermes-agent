@@ -123,8 +123,46 @@ def _telegram():
                          user_name="n", chat_name="n", chat_type="dm", thread_id=None)
 
 
+class _RecordingStore:
+    """Minimal session-store stand-in: in-memory metadata + overrides, durable reads."""
+
+    def __init__(self):
+        self.meta = {}
+
+    def get_session_metadata(self, key, k, default=None):
+        return self.meta.get((key, k), default)
+
+    def set_session_metadata(self, key, k, value):
+        if value is None:
+            self.meta.pop((key, k), None)
+        else:
+            self.meta[(key, k)] = value
+        return True
+
+
+def _fake_runner(override=None, *, peek_error=None):
+    """A runner fake with readable session state + a durable metadata store."""
+    states = {}
+
+    def _peek(_key):
+        if peek_error is not None:
+            raise peek_error
+        return states.get(_key)
+
+    def _state(_key):
+        return states.setdefault(_key, SimpleNamespace(conversation=SimpleNamespace(
+            model_override=override, autorouter_managed=None)))
+
+    runner = SimpleNamespace(
+        _peek_session_state=_peek,
+        _session_state=_state,
+        session_store=_RecordingStore(),
+    )
+    return runner, states
+
+
 def _peek_state(override):
-    state = SimpleNamespace(conversation=SimpleNamespace(model_override=override))
+    state = SimpleNamespace(conversation=SimpleNamespace(model_override=override, autorouter_managed=None))
     return lambda _key: state
 
 
@@ -135,7 +173,7 @@ def _peek_state(override):
 def test_ordinary_session_routes_through_consumer(consumer_session, monkeypatch):
     _no_policy(monkeypatch)
     seen = _stub_runner_kwargs(monkeypatch)
-    runner = SimpleNamespace(_peek_session_state=lambda _key: None)
+    runner, _states = _fake_runner()
     model, kwargs, applied = pre_turn_route(
         runner=runner, source=_telegram(), session_key="key-1",
         user_config={}, model="stock-model", runtime_kwargs=dict(_STOCK_RUNTIME))
@@ -150,7 +188,7 @@ def test_ordinary_passthrough_is_byte_identical_stock(consumer_session, monkeypa
     _no_policy(monkeypatch)
     monkeypatch.setenv("FIXTURE_OUTCOME", "passthrough")
     seen = _stub_runner_kwargs(monkeypatch)
-    runner = SimpleNamespace(_peek_session_state=lambda _key: None)
+    runner, _states = _fake_runner()
     model, kwargs, applied = pre_turn_route(
         runner=runner, source=_telegram(), session_key="key-2",
         user_config={}, model="stock-model", runtime_kwargs=dict(_STOCK_RUNTIME))
@@ -164,7 +202,7 @@ def test_ordinary_refusal_fails_closed_without_provider_resolution(consumer_sess
     _no_policy(monkeypatch)
     monkeypatch.setenv("FIXTURE_OUTCOME", "refuse")
     seen = _stub_runner_kwargs(monkeypatch)
-    runner = SimpleNamespace(_peek_session_state=lambda _key: None)
+    runner, _states = _fake_runner()
     with pytest.raises(AutoRouterRefusal) as excinfo:
         pre_turn_route(runner=runner, source=_telegram(), session_key="key-3",
                        user_config={}, model="stock-model", runtime_kwargs=dict(_STOCK_RUNTIME))
@@ -176,7 +214,7 @@ def test_ordinary_consumer_exception_fails_closed(consumer_session, monkeypatch)
     _no_policy(monkeypatch)
     monkeypatch.setenv("FIXTURE_OUTCOME", "raise")
     seen = _stub_runner_kwargs(monkeypatch)
-    runner = SimpleNamespace(_peek_session_state=lambda _key: None)
+    runner, _states = _fake_runner()
     with pytest.raises(AutoRouterRefusal):
         pre_turn_route(runner=runner, source=_telegram(), session_key="key-4",
                        user_config={}, model="stock-model", runtime_kwargs=dict(_STOCK_RUNTIME))
@@ -196,7 +234,7 @@ def test_ordinary_no_consumer_registered_is_byte_identical_stock(tmp_path, monke
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
     _no_policy(monkeypatch)
     seen = _stub_runner_kwargs(monkeypatch)
-    runner = SimpleNamespace(_peek_session_state=lambda _key: None)
+    runner, _states = _fake_runner()
     model, kwargs, applied = pre_turn_route(
         runner=runner, source=_telegram(), session_key="key-5",
         user_config={}, model="stock-model", runtime_kwargs=dict(_STOCK_RUNTIME))
@@ -281,7 +319,7 @@ def test_policy_session_with_autorouter_selection_re_resolves(monkeypatch):
         lambda **kw: ({"provider": "localb", "api_key": "sk-b", "base_url": "http://127.0.0.1:8402/v1",
                        "api_mode": "chat_completions", "request_overrides": {}, "capabilities": {}},
                       {"provider": "localb", "model": "local-model-b"}))
-    runner = SimpleNamespace(_peek_session_state=lambda _key: None)
+    runner, _states = _fake_runner()
     model, kwargs, applied = pre_turn_route(
         runner=runner, source=_telegram(), session_key="sess-10",
         user_config={}, model="frozen-model", runtime_kwargs=dict(_STOCK_RUNTIME))
@@ -296,7 +334,7 @@ def test_policy_session_with_plain_selection_is_untouched(monkeypatch):
             {"model": {"provider": "custom"}}, "frozen-model"))
     monkeypatch.setattr("gateway.session_policy.policy_for_source", lambda runner, source: policy)
     monkeypatch.setattr("gateway.session_authorities.active_authority", lambda runner: object())
-    runner = SimpleNamespace(_peek_session_state=lambda _key: None)
+    runner, _states = _fake_runner()
     model, kwargs, applied = pre_turn_route(
         runner=runner, source=_telegram(), session_key="sess-11",
         user_config={}, model="frozen-model", runtime_kwargs=dict(_STOCK_RUNTIME))
