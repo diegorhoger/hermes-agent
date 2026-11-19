@@ -54,8 +54,34 @@ async function grant(files: PluginFiles, folder = vault): Promise<string> {
 
 // Linux volumes are case-sensitive, so they stand in for a case-sensitive
 // macOS volume here: `Vault` and `vault` are two folders.
+
+function caseSensitiveFs(dir = scratch): boolean {
+  const probe = path.join(dir, `.case-probe-${process.pid}-${Math.random().toString(16).slice(2)}`)
+  const alt = probe + '-ALT'
+  try {
+    fs.mkdirSync(probe)
+    return !fs.existsSync(alt.toLowerCase() === probe.toLowerCase() ? path.join(path.dirname(probe), path.basename(probe).toUpperCase()) : alt)
+  } catch {
+    return false
+  } finally {
+    try { fs.rmSync(probe, { recursive: true, force: true }) } catch {}
+  }
+}
+
+const caseSensitive = (() => {
+  try {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-case-'))
+    const a = path.join(d, 'Vault')
+    const b = path.join(d, 'vault')
+    fs.mkdirSync(a)
+    const sensitive = !fs.existsSync(b)
+    fs.rmSync(d, { recursive: true, force: true })
+    return sensitive
+  } catch { return false }
+})()
+
 describe('case on a case-sensitive macOS volume', () => {
-  it.runIf(posix)('a link from the granted Vault into a sibling vault is outside the folder', async () => {
+  it.runIf(posix && caseSensitive)('a link from the granted Vault into a sibling vault is outside the folder', async () => {
     const files = make('darwin')
     const id = await grant(files)
     const sibling = path.join(scratch, 'home', 'vault')
@@ -69,7 +95,7 @@ describe('case on a case-sensitive macOS volume', () => {
     expect(JSON.stringify(read)).not.toContain('not granted')
   })
 
-  it.runIf(posix)('a granted Vault replaced by a differently-cased vault must be granted again', async () => {
+  it.runIf(posix && caseSensitive)('a granted Vault replaced by a differently-cased vault must be granted again', async () => {
     const files = make('darwin')
     const id = await grant(files)
     fs.renameSync(vault, path.join(scratch, 'home', 'vault'))
@@ -81,7 +107,7 @@ describe('case on a case-sensitive macOS volume', () => {
     })
   })
 
-  it.runIf(posix)('a differently-cased spelling of the Hermes home still cannot be granted', async () => {
+  it.runIf(posix && caseSensitive)('a differently-cased spelling of the Hermes home still cannot be granted', async () => {
     const lookalike = path.join(scratch, 'home', '.HERMES')
     fs.mkdirSync(lookalike)
 

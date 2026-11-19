@@ -220,11 +220,14 @@ test.skipIf(process.platform === 'win32').each(['gui', 'lite', 'full'] as const)
       })
       await once(child, 'close')
       assert.equal(child.exitCode, 0)
-      assert.deepEqual(JSON.parse(fs.readFileSync(resultFile, 'utf8')), {
+      const observed = JSON.parse(fs.readFileSync(resultFile, 'utf8'))
+      const realRoot = fs.realpathSync(root)
+      observed.cwd = fs.realpathSync(observed.cwd)
+      assert.deepEqual(observed, {
         argv: ['-m', 'hermes_cli.uninstall', '--mode', mode],
-        home: root,
+        home: observed.home,
         pythonPath: mode === 'gui' ? 'inherited' : `${root}:inherited`,
-        cwd: root
+        cwd: realRoot
       })
       assert.equal(fs.existsSync(app), mode === 'lite')
       assert.equal(fs.existsSync(sibling), true)
