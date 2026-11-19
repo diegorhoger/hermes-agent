@@ -4,7 +4,11 @@
  * repoint the user's installed handler at that checkout. `HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION=1`
  * (set by the E2E harnesses) leaves the OS registration untouched; deep links that arrive
  * through argv / second-instance still route normally.
+ *
+ * Commit-identified private builds must never claim the production hermes:// handler.
  */
+
+import { PRODUCT_IDENTITY } from './product-identity'
 
 export interface ProtocolRegistrar {
   setAsDefaultProtocolClient: (protocol: string, path?: string, args?: string[]) => boolean
@@ -20,13 +24,22 @@ export interface DeepLinkProtocolOptions {
   execPath: string
   resolve: (entry: string) => string
   log: (line: string) => void
+  /** Test override; production defaults to the baked, commit-specific product identity. */
+  isolatedCommitBuild?: boolean
 }
 
 export function registerDeepLinkProtocol(options: DeepLinkProtocolOptions): void {
   const { app, protocol, env, defaultApp, argv, execPath, resolve, log } = options
 
-  if (env.HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION === '1') {
-    log(`[deeplink] ${protocol}:// registration skipped (HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION)`)
+  // Commit builds use a separate app ID/userData, but without this guard they
+  // still overwrite the OS-wide hermes:// default handler at launch.
+  const isolatedCommitBuild = options.isolatedCommitBuild ??
+    (PRODUCT_IDENTITY.channel === null && PRODUCT_IDENTITY.appNamePascal !== PRODUCT_IDENTITY.artifactNamePascal)
+  if (env.HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION === '1' || isolatedCommitBuild) {
+    const reason = env.HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION === '1'
+      ? 'HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION'
+      : 'isolated commit build'
+    log(`[deeplink] ${protocol}:// registration skipped (${reason})`)
 
     return
   }
