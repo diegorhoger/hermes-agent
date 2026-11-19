@@ -689,16 +689,17 @@ async function pidIsOurDashboard(
     `expected_token=os.path.expanduser(${shq(ownershipId ? spawnTokenPath(ownershipId, spawnNonce) : '')})\n` +
     `expected_profile=${shq(profile)}\n` +
     `nonce=${shq(spawnNonce)}\n` +
+    'ps_line=""\n' +
     'try:\n' +
     ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
     ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
     'except OSError:\n' +
     ' try:\n' +
-    '  line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
+    '  ps_line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).rstrip("\\n")\n' +
     ' except subprocess.CalledProcessError:\n' +
     '  # pid already gone — a dead process is FOREIGN, not a transport error\n' +
     '  print("FOREIGN");sys.exit(0)\n' +
-    ' args=shlex.split(line)\n' +
+    ' args=shlex.split(ps_line)\n' +
     'ok=False\n' +
     'try:\n' +
     // A profile literally named "serve" puts the value token before the
@@ -716,13 +717,45 @@ async function pidIsOurDashboard(
     ' isolated_count=args.count("--isolated")\n' +
     ' profile_count=args.count("--profile")\n' +
     ' direct=args[0] in expected_entries\n' +
-    ' python_entry=len(args)>1 and args[1] in expected_entries and os.path.basename(args[0]).startswith("python")\n' +
+    ' python_entry=len(args)>1 and args[1] in expected_entries and os.path.basename(args[0]).lower().startswith("python")\n' +
     ' token_ok=not expected_token or args[token+1]==expected_token\n' +
     ' isolated_ok=isolated_count==1 and isolated>serve\n' +
     ' profile_ok=(profile_count==1 and profile_arg<serve and args[profile_arg+1]==expected_profile) if expected_profile else profile_count==0\n' +
     ' spawn_proof=bool(expected_token) and owner_count==1 and token_count==1 and token_ok and profile_ok\n' +
     ' ok=(direct or python_entry or spawn_proof) and serve_count==1 and isolated_ok and owner_count==1 and args[owner+1]==nonce and token_ok and profile_ok\n' +
     'except (ValueError,IndexError):pass\n' +
+    // ps(1) output is space-joined and lossy for argv tokens containing spaces;
+    // fall back to anchored raw-line checks when shlex.split corrupted parsing.
+    'if not ok and ps_line:\n' +
+    ' try:\n' +
+    '  owner_flag="--ssh-owner-nonce " + nonce\n' +
+    '  token_flag="--ssh-session-token-file " + expected_token if expected_token else ""\n' +
+    '  profile_flag="--profile " + expected_profile + " " if expected_profile else ""\n' +
+    '  owner_count=ps_line.count("--ssh-owner-nonce ")\n' +
+    '  token_count=ps_line.count("--ssh-session-token-file ")\n' +
+    '  isolated_count=ps_line.count(" --isolated")\n' +
+    '  profile_count=ps_line.count("--profile ")\n' +
+    '  serve_count=ps_line.count(" serve ")\n' +
+    '  owner_idx=ps_line.find(owner_flag)\n' +
+    '  token_idx=ps_line.find(token_flag) if token_flag else -1\n' +
+    '  isolated_idx=ps_line.find(" --isolated")\n' +
+    '  serve_idx=ps_line.find(" serve ")\n' +
+    '  profile_idx=ps_line.find(profile_flag) if profile_flag else -1\n' +
+    '  token_ok=not expected_token or (token_count==1 and token_idx>=0)\n' +
+    '  profile_ok=(profile_count==1 and profile_idx>=0 and serve_idx>profile_idx) if expected_profile else profile_count==0\n' +
+    '  isolated_ok=isolated_count==1 and isolated_idx>=0 and serve_idx>=0 and isolated_idx>serve_idx\n' +
+    '  spawn_proof=bool(expected_token) and owner_count==1 and token_ok and profile_ok\n' +
+    '  direct=ps_line.startswith(expected+" ") or ps_line==expected\n' +
+    '  python_entry=False\n' +
+    '  for p in expected_entries:\n' +
+    '   if p==expected: continue\n' +
+    '   i=ps_line.find(p)\n' +
+    '   if i>0 and ps_line[i-1]==" " and (i+len(p)==len(ps_line) or ps_line[i+len(p)]==" "):\n' +
+    '    prefix=os.path.basename(ps_line[:i].strip()).lower()\n' +
+    '    if prefix.startswith("python"): python_entry=True\n' +
+    '  ok=(direct or python_entry or spawn_proof) and serve_count==1 and isolated_ok and owner_count==1 and owner_idx>=0 and token_ok and profile_ok\n' +
+    ' except Exception:\n' +
+    '  ok=False\n' +
     'print("OWNED" if ok else "FOREIGN")'
 
   const verdict = await execProbeVerdict(

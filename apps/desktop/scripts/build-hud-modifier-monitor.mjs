@@ -47,10 +47,11 @@ export function buildHudModifierMonitor({
   mkdirSync(stagingDir, { recursive: true })
   try {
     if (platform === 'darwin') {
+      const sdk = sysroot === undefined ? macosSysroot() : sysroot
       execFileSync(
         'xcrun',
         [
-          ...xcrunClangArgv(sysroot === undefined ? macosSysroot() : sysroot),
+          ...xcrunClangArgv(sdk),
           '-arch',
           'arm64',
           '-arch',
@@ -69,7 +70,7 @@ export function buildHudModifierMonitor({
           '-o',
           staging
         ],
-        { stdio: 'pipe', timeout: 120_000 }
+        { stdio: 'pipe', timeout: 120_000, env: { ...process.env, ...(sdk ? { SDKROOT: sdk } : {}) } }
       )
     } else if (platform === 'win32') {
       execFileSync(resolveWindowsFrameworkCompiler(), [
