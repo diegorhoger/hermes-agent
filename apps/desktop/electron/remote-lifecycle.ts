@@ -724,8 +724,10 @@ async function pidIsOurDashboard(
     ' spawn_proof=bool(expected_token) and owner_count==1 and token_count==1 and token_ok and profile_ok\n' +
     ' ok=(direct or python_entry or spawn_proof) and serve_count==1 and isolated_ok and owner_count==1 and args[owner+1]==nonce and token_ok and profile_ok\n' +
     'except (ValueError,IndexError):pass\n' +
-    // ps(1) output is space-joined and lossy for argv tokens containing spaces;
-    // fall back to anchored raw-line checks when shlex.split corrupted parsing.
+    // ps(1) joins argv without preserving boundaries for paths containing spaces.
+    // Fail closed unless the expected ownership flags and COMPLETE values have
+    // distinct word boundaries and occur in the required serve-side order.
+    // Never infer ownership from a partial nonce/token prefix.
     'if not ok and ps_line:\n' +
     ' try:\n' +
     '  owner_flag="--ssh-owner-nonce " + nonce\n' +
@@ -733,15 +735,18 @@ async function pidIsOurDashboard(
     '  profile_flag="--profile " + expected_profile + " " if expected_profile else ""\n' +
     '  owner_count=ps_line.count("--ssh-owner-nonce ")\n' +
     '  token_count=ps_line.count("--ssh-session-token-file ")\n' +
-    '  isolated_count=ps_line.count(" --isolated")\n' +
+    '  isolated_count=ps_line.count(" --isolated ") + (1 if ps_line.endswith(" --isolated") else 0)\n' +
     '  profile_count=ps_line.count("--profile ")\n' +
     '  serve_count=ps_line.count(" serve ")\n' +
-    '  owner_idx=ps_line.find(owner_flag)\n' +
-    '  token_idx=ps_line.find(token_flag) if token_flag else -1\n' +
-    '  isolated_idx=ps_line.find(" --isolated")\n' +
+    '  owner_idx=ps_line.find(" "+owner_flag+" ")\n' +
+    '  if owner_idx<0 and ps_line.endswith(" "+owner_flag): owner_idx=len(ps_line)-len(owner_flag)-1\n' +
+    '  token_idx=ps_line.find(" "+token_flag+" ") if token_flag else -1\n' +
+    '  if token_flag and token_idx<0 and ps_line.endswith(" "+token_flag): token_idx=len(ps_line)-len(token_flag)-1\n' +
+    '  isolated_idx=ps_line.find(" --isolated ")\n' +
+    '  if isolated_idx<0 and ps_line.endswith(" --isolated"): isolated_idx=len(ps_line)-len(" --isolated")\n' +
     '  serve_idx=ps_line.find(" serve ")\n' +
     '  profile_idx=ps_line.find(profile_flag) if profile_flag else -1\n' +
-    '  token_ok=not expected_token or (token_count==1 and token_idx>=0)\n' +
+    '  token_ok=not expected_token or (token_count==1 and token_idx>serve_idx)\n' +
     '  profile_ok=(profile_count==1 and profile_idx>=0 and serve_idx>profile_idx) if expected_profile else profile_count==0\n' +
     '  isolated_ok=isolated_count==1 and isolated_idx>=0 and serve_idx>=0 and isolated_idx>serve_idx\n' +
     '  spawn_proof=bool(expected_token) and owner_count==1 and token_ok and profile_ok\n' +
@@ -753,7 +758,7 @@ async function pidIsOurDashboard(
     '   if i>0 and ps_line[i-1]==" " and (i+len(p)==len(ps_line) or ps_line[i+len(p)]==" "):\n' +
     '    prefix=os.path.basename(ps_line[:i].strip()).lower()\n' +
     '    if prefix.startswith("python"): python_entry=True\n' +
-    '  ok=(direct or python_entry or spawn_proof) and serve_count==1 and isolated_ok and owner_count==1 and owner_idx>=0 and token_ok and profile_ok\n' +
+    '  ok=(direct or python_entry or spawn_proof) and serve_count==1 and isolated_ok and owner_count==1 and owner_idx>serve_idx and token_ok and profile_ok\n' +
     ' except Exception:\n' +
     '  ok=False\n' +
     'print("OWNED" if ok else "FOREIGN")'
