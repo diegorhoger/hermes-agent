@@ -1,0 +1,73 @@
+name: Fork smoke (GitHub-hosted)
+
+# Secret-free, validation-only lane for the stacked AutoRouter picker PR.
+# The upstream Blacksmith lanes in ci.yaml are intentionally left untouched;
+# this workflow provides an independent GitHub-hosted signal for the same
+# focused tests. It publishes nothing, deploys nothing, bills nothing and
+# reads no credentials.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/fork-smoke.yaml'
+      - 'tui_gateway/**'
+      - 'hermes_cli/**'
+      - 'gateway/**'
+      - 'agent/**'
+      - 'tests/hermes_cli/test_pre_inference_route_host.py'
+      - 'tests/hermes_cli/test_autorouter_picker_host.py'
+      - 'tests/hermes_cli/test_resume_model_restore.py'
+      - 'tests/gateway/test_session_mutation_model.py'
+      - 'tests/gateway/test_session_local_route.py'
+      - 'tests/tui_gateway/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Focused seam, picker, resume and gateway tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TZ: UTC
+      LANG: C.UTF-8
+      PYTHONHASHSEED: '0'
+      CI: 'true'
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.11.14'
+          python-version: '3.14'
+
+      - name: Sync dependencies
+        run: uv sync --frozen --group dev --extra acp
+
+      - name: Focused tests via canonical Hermes runner
+        run: |
+          set -euo pipefail
+          # The frozen uv sync above establishes the checkout-specific venv.
+          # run_tests.sh uses the documented HERMES_PYTHON override and supplies
+          # hermetic env filtering, independent file workers and timeout policy.
+          files=(
+            tests/hermes_cli/test_pre_inference_route_host.py
+            tests/hermes_cli/test_autorouter_picker_host.py
+            tests/hermes_cli/test_resume_model_restore.py
+            tests/gateway/test_session_mutation_model.py
+            tests/gateway/test_session_local_route.py
+            tests/tui_gateway/test_session_resume_db_ownership.py
+            tests/tui_gateway/test_resume_switched_provider_endpoint.py
+          )
+          HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh -j 2 "${files[@]}" -q

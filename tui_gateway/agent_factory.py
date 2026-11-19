@@ -138,6 +138,16 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     if room_plumbing or (_row_follows_profile(row) and not composer_profile_matches):
         return {}
     overrides: dict = {}
+    selection = model_config.get("_selection")
+    if isinstance(selection, dict) and str(selection.get("provider", "")).lower() == "autorouter" \
+            and str(selection.get("model", "")).lower() == "auto-free":
+        # Restoring the virtual pick on resume; the build resolves physical via the consumer.
+        overrides.update({
+            "model_override": {"model": "auto-free", "provider": "autorouter",
+                               "base_url": None, "api_mode": None},
+            "provider_override": "autorouter",
+        })
+        return overrides
     # Canonical model + route readers shared with CLI --resume: the pick, not a fallback that rewrote the
     # billing column; then nested ``gateway_runtime`` before the TUI's top-level keys, then a routable
     # ``billing_provider`` (#125942).
@@ -212,11 +222,16 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     from hermes_cli.runtime_provider_custom import session_provider_identity
     provider = session_provider_identity(attr("provider"), attr("requested_provider"), base_url, model)
     reasoning_config = getattr(agent, "reasoning_config", None)
+    requested = str(getattr(agent, "requested_provider", "") or "").strip().lower()
     live = {
         "model": model, "provider": provider, "base_url": base_url, "api_mode": attr("api_mode"),
         # An empty dict is still a real (present) reasoning config.
         "reasoning_config": reasoning_config if isinstance(reasoning_config, dict) else None,
         "service_tier": getattr(agent, "service_tier", None),
+        # Persist the user's selection separately from the route it resolved to:
+        # resume must re-derive the route (consumer may have rotated), so the
+        # virtual pick, not the physical runtime, round-trips through resume.
+        **({"_selection": {"provider": "autorouter", "model": "auto-free"}} if requested == "autorouter" else {}),
     }
     for key, value in live.items():
         if value or isinstance(value, dict):
@@ -645,6 +660,71 @@ def _startup_system_prompt(cfg: dict, task_id: str) -> str:
     return system_prompt
 
 
+def _autorouter_selection_override(sid, session_id, key, model_override, provider_override):
+    """MODE A — explicit per-session AutoRouter selection (issue #116).
+
+    An explicit pick of ``auto-free`` (or ``autorouter/auto-free``) is resolved
+    to an eligible PHYSICAL provider/model through the registered
+    ``pre_inference_route`` consumer and the client is built on that physical
+    route — the virtual identifier never reaches a provider. This branch runs
+    BEFORE the explicit physical-pick check, which would otherwise treat the
+    virtual pick as an ordinary pin.
+
+    Fail-closed everywhere, zero provider requests on refusal:
+
+    * resolver unavailable / plugin disabled / consumer missing or refusing /
+      malformed decision / no eligible route: ``RuntimeError`` before any
+      provider client is constructed — never widened into stock routing.
+    * explicit physical picks are never rewritten.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+
+    def _pick(model_override, provider_override):
+        if isinstance(model_override, dict):
+            return model_override.get("model"), model_override.get("provider") or provider_override
+        return model_override, provider_override
+
+    model, provider = _pick(model_override, provider_override)
+    try:
+        from hermes_cli.autorouter_picker import (
+            actionable, gate_reason, is_autorouter_pick, resolve_autorouter_physical,
+        )
+    except Exception as exc:
+        try:
+            from hermes_cli.autorouter_picker import is_autorouter_pick as _is_pick
+
+            probe = bool(_is_pick(model, provider))
+        except Exception:
+            probe = False
+        if probe:
+            log.warning("AutoRouter selection requested but the host resolver import failed; refusing",
+                        exc_info=True)
+            raise RuntimeError(
+                "AutoRouter selection refused before any provider request: host resolver unavailable") from exc
+        return None
+    if not is_autorouter_pick(model, provider):
+        return None
+    if not actionable():
+        # An explicit virtual pin on an unsupported/unactionable host must fail closed — never
+        # widen to any stock route.
+        try:
+            why = gate_reason() or "unknown"
+        except Exception:
+            why = "unknown"
+        log.warning("AutoRouter selection refused: not actionable on this host: %s", why)
+        raise RuntimeError(f"AutoRouter selection refused before any provider request: {why}")
+
+    session_key = session_id or sid or key
+    try:
+        _runtime, receipt = resolve_autorouter_physical(session_id=session_key, platform="tui")
+    except Exception as exc:
+        log.warning("AutoRouter selection refused; no provider request will be issued", exc_info=True)
+        raise RuntimeError(str(exc)) from exc
+    return {"model": receipt["model"], "provider": receipt["provider"]}, None
+
+
 def _pre_inference_route_override(sid, session_id, key, model_override, provider_override,
                                   cfg, platform_override):
     """AutoRouter opt-in pre-inference route (host extension, issue #104).
@@ -762,8 +842,16 @@ def _make_agent(
     from agent.shell_hooks import register_from_config
     register_from_config(cfg)
     system_prompt = _startup_system_prompt(cfg, session_id or key)
-    model_override, provider_override = _pre_inference_route_override(
-        sid, session_id, key, model_override, provider_override, cfg, platform_override)
+    autorouter_override = _autorouter_selection_override(
+        sid, session_id, key, model_override, provider_override)
+    if autorouter_override is not None:
+        # The virtual pick resolves to the session-consistent physical route; the agent is built
+        # on it. The operator-visible session pin keeps provider="autorouter" for the composer UI;
+        # this local replacement is only what the client constructor sees.
+        model_override, provider_override = autorouter_override
+    else:
+        model_override, provider_override = _pre_inference_route_override(
+            sid, session_id, key, model_override, provider_override, cfg, platform_override)
     model, runtime = _resolve_agent_model_runtime(model_override, provider_override)
     fallback_notice = runtime.pop("_fallback_notice", None)
     _pr = _load_provider_routing()
