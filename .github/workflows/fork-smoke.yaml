@@ -17,6 +17,9 @@ on:
       - 'tests/hermes_cli/test_pre_inference_route_host.py'
       - 'tests/hermes_cli/test_autorouter_picker_host.py'
       - 'tests/hermes_cli/test_resume_model_restore.py'
+      - 'tests/hermes_cli/test_plugin_capabilities.py'
+      - 'tests/agent/test_credential_scope.py'
+      - 'tests/agent/test_quota_observation.py'
       - 'tests/gateway/test_session_mutation_model.py'
       - 'tests/gateway/test_session_local_route.py'
       - 'tests/tui_gateway/**'
@@ -69,5 +72,8 @@ jobs:
             tests/gateway/test_session_local_route.py
             tests/tui_gateway/test_session_resume_db_ownership.py
             tests/tui_gateway/test_resume_switched_provider_endpoint.py
+            tests/agent/test_credential_scope.py
+            tests/agent/test_quota_observation.py
+            tests/hermes_cli/test_plugin_capabilities.py
           )
           HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh -j 2 "${files[@]}" -q
