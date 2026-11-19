@@ -1908,26 +1908,100 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 409, code="model_lock_unavailable")
         return None
 
-    def _persist_session_runtime_lock(self, session_id: str, runtime_request: dict[str, Any]) -> bool:
+    def _persist_session_runtime_lock(self, session_id: str, runtime_request: dict[str, Any],
+                                      marker_keys: tuple[str, ...] = ()) -> tuple[bool, Optional[str]]:
         # Persist only a newly confirmed lock: a reused stored lock must not be rewritten each
         # turn, and a one-off request override must not erase a confirmed lock.
+        # Returns ``(persisted, reconciliation_failure)``. ``persisted`` is True when the store
+        # holds the confirmed lock (reused locks are not rewritten). ``reconciliation_failure``
+        # is set only when the lock landed but the session's AutoRouter managed marker could
+        # not be reconciled at this commit boundary; callers must surface it, never conceal it.
         if runtime_request.get("persisted_lock") or not runtime_request.get("require_model_lock"):
-            return True
+            return True, None
         model, provider = self._requested_ids(runtime_request.get("requested"))
         if not model and not provider:
-            return False
+            return False, None
         if (store := self._store_beside(self._ensure_store())) is None:
-            return False
+            return False, None
         try:
             store.sessions.set_runtime_lock(session_id, RuntimeLock(
                 model=model or None, provider=provider or None,
                 model_options=runtime_request.get("model_options") or {},
                 route_source=runtime_request.get("route_source") or "",
                 confirmed=bool(runtime_request.get("require_model_lock"))))
-            return True
         except Exception:
             logger.warning("[%s] failed to persist session runtime lock for %s", self.name, session_id, exc_info=True)
-            return False
+            return False, None
+        reconcile_failure = self._reconcile_managed_marker_after_lock(
+            session_id, model=model, provider=provider, marker_keys=marker_keys)
+        return True, reconcile_failure
+
+    def _marker_reconcile_keys(self, request: web.Request) -> tuple[str, ...]:
+        """The keys a turn on this request would use, in TurnRunner's precedence:
+        ``X-Hermes-Session-Key`` first, then the session id."""
+        keys: list[str] = []
+        try:
+            header = (request.headers.get("X-Hermes-Session-Key") or "").strip()
+        except Exception:
+            header = ""
+        if header and not re.search(r'[\r\n\x00]', header) and len(header) <= self._MAX_SESSION_HEADER_LEN:
+            keys.append(header)
+        session_id = str(request.match_info.get("session_id") or "").strip()
+        if session_id and session_id not in keys:
+            keys.append(session_id)
+        return tuple(keys)
+
+    def _reconcile_managed_marker_after_lock(self, session_id: str, *, model: Optional[str],
+                                             provider: Optional[str], marker_keys: tuple[str, ...] = ()) -> Optional[str]:
+        """Reconcile the AutoRouter managed marker after an operator durably commits a
+        *physical* session model lock — the api_server equivalent of the messaging
+        ``/model --session`` commit boundary (:func:`gateway.autorouter_turn.clear_managed_marker_durable`).
+
+        An AutoRouter virtual pick is the managed binding itself, so the marker stays by
+        design. Returns ``None`` when there is nothing to reconcile or every copy cleared;
+        otherwise a failure message the caller must surface — never a silent success.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            # In-process/non-authority embed: no TurnRunner, no managed sessions.
+            return None
+        try:
+            from gateway.autorouter_turn import (
+                _is_virtual_pick,
+                clear_managed_marker_durable,
+                managed_marker_present,
+            )
+        except Exception:
+            logger.warning("[%s] managed-marker reconciliation helpers unavailable for %s",
+                           self.name, session_id, exc_info=True)
+            return "the managed-routing reconciliation helper is unavailable on this host"
+        committed = {"model": model or "", "provider": provider or ""}
+        if _is_virtual_pick(committed):
+            return None
+        keys: list[str] = []
+        for key in (*marker_keys, session_id):
+            key = str(key or "").strip()
+            if key and key not in keys:
+                keys.append(key)
+        failures: list[str] = []
+        for key in keys:
+            try:
+                present = managed_marker_present(runner, key)
+            except Exception as exc:
+                detail = getattr(exc, "args", [None])
+                failures.append(f"{(detail[0] if detail else None) or exc or type(exc).__name__}")
+                continue
+            if not present:
+                continue  # no managed marker under this key: nothing to clear
+            try:
+                clear_managed_marker_durable(runner, key)
+            except Exception as exc:
+                detail = getattr(exc, "args", [None])
+                failures.append(f"{(detail[0] if detail else None) or exc or type(exc).__name__}")
+        if failures:
+            logger.warning("[%s] managed-marker reconciliation failed for %s: %s", self.name, session_id, failures)
+            return "; ".join(failures)
+        return None
 
     @staticmethod
     def _parse_session_model_config(raw: Any) -> dict[str, Any]:
@@ -2825,9 +2899,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return None, lock_error
-        if not await asyncio.to_thread(self._persist_session_runtime_lock, session_id, runtime_request):
+        marker_keys = self._marker_reconcile_keys(request)
+        persisted, reconcile_failure = await asyncio.to_thread(
+            self._persist_session_runtime_lock, session_id, runtime_request, marker_keys)
+        if not persisted:
             return None, _error_response(
                 "Could not persist the requested session model lock", 500, code="model_lock_persistence_failed")
+        if reconcile_failure is not None:
+            return None, _error_response(
+                "The session model lock was saved, but the AutoRouter managed-routing marker "
+                "could not be reconciled; the session may still refuse unpinned turns",
+                500, code="managed_marker_reconciliation_failed", param=reconcile_failure)
         lock_active = bool(runtime_request.get("require_model_lock"))
         if lock_active:
             route = runtime_request.get("route")
@@ -3249,9 +3331,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
-        if not await asyncio.to_thread(self._persist_session_runtime_lock, session_id, runtime_request):
+        marker_keys = self._marker_reconcile_keys(request)
+        persisted, reconcile_failure = await asyncio.to_thread(
+            self._persist_session_runtime_lock, session_id, runtime_request, marker_keys)
+        if not persisted:
             return _error_response(
                 "Could not persist the requested session model lock", 500, code="model_lock_persistence_failed")
+        if reconcile_failure is not None:
+            # The lock landed; never report a clean success while the session can
+            # still refuse unpinned turns on a stale managed marker.
+            return _error_response(
+                "The session model lock was saved, but the AutoRouter managed-routing marker "
+                "could not be reconciled; the session may still refuse unpinned turns",
+                500, code="managed_marker_reconciliation_failed", param=reconcile_failure)
         requested = runtime_request.get("requested") or {}
         route = runtime_request.get("route") or {}
         runtime = self._sanitize_runtime_metadata(

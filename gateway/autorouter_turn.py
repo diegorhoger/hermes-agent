@@ -313,6 +313,41 @@ def _persist_managed_marker(runner, session_key: str, mode: str) -> bool:
     return ok
 
 
+def managed_marker_present(runner, session_key: str):
+    """``True`` when any managed-marker evidence exists for this session key.
+
+    Purpose-built for the *authorized reconcile* boundary (an explicit operator
+    pick): any marker evidence — including corrupt or disagreeing copies — is a
+    present marker that an explicit pick is authorized to clear. A read failure
+    is not proof of absence, so it also reports present; the durable clear then
+    either lands or raises and is reported to the operator. ``False`` only when
+    both copies are genuinely missing — the one case where no clear is needed.
+
+    Never authorizes anything by itself; only ``clear_managed_marker_durable``
+    mutates, and only an explicit physical pick reaches it.
+    """
+    key = str(session_key or "").strip()
+    if not key:
+        return False
+    evidence = False
+    peek = getattr(runner, "_peek_session_state", None)
+    if callable(peek):
+        try:
+            state = peek(key)
+        except Exception:
+            return True  # unreadable live state: not proof of absence
+        if state is not None:
+            evidence = getattr(getattr(state, "conversation", None), "autorouter_managed", None) is not None
+    store = getattr(runner, "session_store", None)
+    getter = getattr(store, "get_session_metadata", None) if store is not None else None
+    if callable(getter):
+        try:
+            return evidence or getter(key, MANAGED_METADATA_KEY) is not None
+        except Exception:
+            return True  # unreadable authoritative copy: present for reconcile purposes
+    return evidence
+
+
 def clear_managed_marker_durable(runner, session_key: str) -> None:
     """Durably forget the managed marker at an *authorized* commit boundary.
 
