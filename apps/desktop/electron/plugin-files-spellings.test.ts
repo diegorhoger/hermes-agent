@@ -64,7 +64,9 @@ function caseSensitiveFs(dir = scratch): boolean {
   } catch {
     return false
   } finally {
-    try { fs.rmSync(probe, { recursive: true, force: true }) } catch {}
+    try { fs.rmSync(probe, { recursive: true, force: true }) } catch {
+      // ignore cleanup errors
+    }
   }
 }
 
