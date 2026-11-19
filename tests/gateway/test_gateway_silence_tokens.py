@@ -54,6 +54,9 @@ def _runner(monkeypatch, tmp_path):
     runner.hooks.emit = AsyncMock()
 
     runner.session_store = MagicMock()
+    # A healthy never-managed host reports no durable managed marker (None), not a
+    # truthy auto-mock — the fail-closed read would treat a mock as corrupt state.
+    runner.session_store.get_session_metadata.return_value = None
     runner.session_store.get_or_create_session.return_value = SessionEntry(
         session_key="agent:main:telegram:group:-1001:12345",
         session_id="sess-silent",
