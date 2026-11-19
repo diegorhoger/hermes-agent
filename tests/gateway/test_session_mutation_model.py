@@ -734,3 +734,58 @@ async def test_large_context_guard_reads_the_persisted_anchor_with_no_resident_a
     finally:
         await owner.close()
         store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_selection,expect_preserved", [
+    ({"mode": "autorouter", "model": "auto-free"}, False),
+    ({"mode": "another_mode", "model": "fixture"}, True),
+])
+async def test_physical_model_pick_drops_only_stale_autorouter_selection(
+    tmp_path, monkeypatch, prior_selection, expect_preserved,
+):
+    """A real canonical model mutation must not leave the prior virtual mode
+    in the committed policy or session.info will still advertise Auto (Free).
+    Other independent model metadata must not be indiscriminately deleted.
+    """
+    from dataclasses import asdict
+    from types import SimpleNamespace
+
+    from gateway import session_mutation_model
+    from gateway.session_policy import build_policy, restore_policy
+    from hermes_cli import model_switch
+
+    monkeypatch.setattr(model_switch, "switch_model", lambda **_kw: model_switch.ModelSwitchResult(
+        success=True, new_model="physical-b", target_provider="nvidia",
+        base_url="", api_mode="chat_completions"))
+
+    async def allow_selection(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(session_mutation_model, "_selection_guard_refusal", allow_selection)
+
+    with open_persistence(profile_scope(home=tmp_path)) as store:
+        authority = SimpleNamespace(instance_id="fixture", epoch=1, profile_id="p", persistence=store)
+        authority.runner = SimpleNamespace(
+            session_authority=authority,
+            _resolve_session_agent_runtime=lambda **_kw: (None, {}),
+        )
+        initial = build_policy(
+            {"cwd": str(tmp_path), "model": "physical-a"},
+            {"model": {"provider": "nvidia", "default": "physical-a",
+                       "selection": dict(prior_selection)}},
+        )
+        assert initial.config()["model"]["selection"] == prior_selection
+        prepared = {"snapshot": {"receipt": {"session_id": "sid", "policy": asdict(initial)}}}
+        outcome = await session_mutation_model.prepare_model(
+            authority, SimpleNamespace(source=None, route="r"),
+            {"model": "physical-b", "provider": "nvidia"}, prepared,
+        )
+        committed = restore_policy(outcome["policy"])
+        selected = committed.config()["model"]
+        assert selected["default"] == "physical-b"
+        assert selected["provider"] == "nvidia"
+        if expect_preserved:
+            assert selected["selection"] == prior_selection
+        else:
+            assert "selection" not in selected
