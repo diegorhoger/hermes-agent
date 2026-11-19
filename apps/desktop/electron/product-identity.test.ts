@@ -254,7 +254,11 @@ test('packaging isolates boot metadata and executable names without renaming rel
     const artifact: ReturnType<typeof appIdentity> = appIdentity(fileURLToPath(new URL('../', import.meta.url)))
     assert.equal(artifact.name, identity.artifactNamePascal)
     assert.equal(artifact.identity.msixAppIdWithOrg, config.msix.identityName)
-    assert.deepEqual(config.protocols[0].schemes, ['hermes'])
+    if (build === 'canary') {
+      assert.deepEqual(config.protocols[0].schemes, ['hermes'])
+    } else {
+      assert.deepEqual(config.protocols, [], 'isolated commit build must not advertise hermes://')
+    }
 
     if (build !== 'canary') {
       assert.equal(config.publish, null)
