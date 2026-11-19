@@ -1,0 +1,78 @@
+name: Fork desktop (GitHub-hosted)
+
+# Secret-free, validation-only lane for the AutoRouter integration rehearsal.
+# Runs the locked Desktop toolchain from pm/lock.json (Node 26.12.1,
+# pnpm 12.15.0 via .github/actions/setup-pm) and the Desktop checks:
+# typecheck, ESLint, the UI Vitest project (picker, model controls,
+# canonical session.mutate, virtual/physical selection, resume and
+# picker-pill persistence) and the Electron Vitest project.
+# The upstream Blacksmith lanes in ci.yaml are intentionally left untouched;
+# this workflow publishes nothing, deploys nothing, bills nothing and reads
+# no credentials.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/fork-desktop.yaml'
+      - 'apps/desktop/**'
+      - 'pm/**'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '.github/actions/setup-pm/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Desktop typecheck, lint, UI and Electron tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TZ: UTC
+      LANG: C.UTF-8
+      CI: 'true'
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up the locked JS/Python toolchain
+        id: pm
+        uses: ./.github/actions/setup-pm
+        with:
+          # Desktop checks also exercise HERMES_PYTHON-backed electron
+          # contracts (hermes_cli/pm code paths), so the test environment is
+          # installed alongside the node toolchain from pm/lock.json.
+          toolchain: all
+          extras: '[]'
+          test-environment: 'true'
+
+      - name: Install zsh and Electron runtime libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y zsh xvfb \
+            libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 \
+            xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
+
+      - name: Install workspace dependencies (locked)
+        run: pnpm install --frozen-lockfile
+
+      - name: Desktop TypeScript typecheck
+        run: pnpm --filter hermes typecheck
+
+      - name: Desktop ESLint
+        run: pnpm --filter hermes lint
+
+      - name: Desktop UI Vitest project (picker, model controls, session.mutate, resume, pill)
+        run: pnpm --filter hermes exec vitest run --project ui
+
+      - name: Desktop Electron Vitest project
+        run: pnpm --filter hermes exec vitest run --project electron
