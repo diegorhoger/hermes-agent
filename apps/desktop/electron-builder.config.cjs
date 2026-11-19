@@ -75,7 +75,9 @@ module.exports = {
   appId,
   productName: displayName,
   executableName: displayName,
-  protocols: [
+  // A private commit build must not advertise the production deep-link
+  // scheme in its macOS Info.plist / Windows registration metadata.
+  protocols: channel === null && appNamePascal !== artifactNamePascal ? [] : [
     {
       name: `${displayName} Protocol`,
       schemes: ['hermes']
