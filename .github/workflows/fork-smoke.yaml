@@ -67,7 +67,6 @@ jobs:
             tests/hermes_cli/test_resume_model_restore.py
             tests/gateway/test_session_mutation_model.py
             tests/gateway/test_session_local_route.py
-            tests/gateway/test_session_mutation_model.py
             tests/tui_gateway/test_session_resume_db_ownership.py
             tests/tui_gateway/test_resume_switched_provider_endpoint.py
           )
