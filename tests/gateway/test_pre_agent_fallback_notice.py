@@ -51,6 +51,11 @@ def _runner_with_real_runtime_resolution():
     # Production resolution: no /model override, no channel override.
     runner._resolve_session_key_or_none.return_value = "test-session-key"
     runner._peek_session_state.return_value = None
+    # The durable managed-marker copy for this fixture's never-managed host is ABSENT:
+    # a bare MagicMock would auto-manufacture a truthy value for get_session_metadata and
+    # read as a corrupt managed marker (fail-closed by design), which is not what a healthy
+    # host without a marker reports.
+    runner.session_store.get_session_metadata.return_value = None
     runner._sessions_map.return_value = {}
     runner._resolve_session_agent_runtime = types.MethodType(GatewayTurnMixin._resolve_session_agent_runtime, runner)
     # Pass the resolved runtime straight through so the kwargs handed to AIAgent are the resolved ones.
