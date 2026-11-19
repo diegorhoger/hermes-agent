@@ -385,8 +385,9 @@ def test_secondary_profile_session_is_not_visible_to_this_adapter(api, owner, tm
 
 
 def test_unavailable_authority_fails_closed(api, owner, monkeypatch):
-    """Missing authority must fail closed: the lock lands, the marker is not cleared,
-    and the endpoint says so — never a silent 200."""
+    """A previously managed session whose persisted binding cannot be resolved must
+    fail closed: the lock lands, the marker is not cleared, and the endpoint says so
+    — never a silent 200."""
     states = _attach_turn_runner_state(owner)
     route = _bind_api_session(api, "sess-parked")
     _seed_corrupt_marker(owner, states, route)
@@ -402,6 +403,44 @@ def test_unavailable_authority_fails_closed(api, owner, monkeypatch):
     monkeypatch.setattr(session_api, "restore_api_session", refusing_restore)
 
     status, payload = asyncio.run(_post_model(api, "sess-parked", _PHYSICAL_BODY))
+
+    assert status == 500
+    assert payload["error"]["code"] == "managed_marker_reconciliation_failed"
+    assert owner.runner.session_store.get_session_metadata(route, "autorouter_managed") == "corrupt!!"
+    assert states[route].conversation.autorouter_managed == "corrupt!!"
+
+
+def test_previously_managed_session_with_missing_binding_refuses(api, owner, monkeypatch):
+    """A previously managed session whose binding is MISSING (lost after admission)
+    is ambiguous: turn history exists but the receipt is gone. The request fails
+    closed; the marker stays; nothing is cleared on a guess."""
+    states = _attach_turn_runner_state(owner)
+    route = _bind_api_session(api, "sess-lost-binding")
+    _seed_corrupt_marker(owner, states, route)
+
+    # The binding disappears from the durable store after admission + turn history.
+    monkeypatch.setattr(owner.persistence.bindings, "api_binding", lambda _sid: None)
+
+    status, payload = asyncio.run(_post_model(api, "sess-lost-binding", _PHYSICAL_BODY))
+
+    assert status == 500
+    assert payload["error"]["code"] == "managed_marker_reconciliation_failed"
+    assert owner.runner.session_store.get_session_metadata(route, "autorouter_managed") == "corrupt!!"
+    assert states[route].conversation.autorouter_managed == "corrupt!!"
+
+
+def test_previously_managed_session_with_unreadable_binding_refuses(api, owner, monkeypatch):
+    """Unreadable binding storage is never treated as absence: refuse, marker intact."""
+    states = _attach_turn_runner_state(owner)
+    route = _bind_api_session(api, "sess-unreadable-binding")
+    _seed_corrupt_marker(owner, states, route)
+
+    def boom(_sid):
+        raise RuntimeError("corrupt binding row")
+
+    monkeypatch.setattr(owner.persistence.bindings, "api_binding", boom)
+
+    status, payload = asyncio.run(_post_model(api, "sess-unreadable-binding", _PHYSICAL_BODY))
 
     assert status == 500
     assert payload["error"]["code"] == "managed_marker_reconciliation_failed"
@@ -442,3 +481,86 @@ def test_marker_absent_on_authoritative_route_is_not_an_error(api, owner):
     _bind_api_session(api, "sess-clean")
     status, payload = asyncio.run(_post_model(api, "sess-clean", _PHYSICAL_BODY))
     assert status == 200, payload
+
+
+# ---------------------------------------------------------------------------
+# Fresh-session lifecycle (Dispatch 147)
+# ---------------------------------------------------------------------------
+
+def _create_session(api, session_id: str, body: dict | None = None):
+    """Create through the real HTTP endpoint; returns (status, payload)."""
+    payload = dict(body or {})
+    payload["id"] = session_id
+
+    async def run():
+        _set_key(api)
+        app = web.Application()
+        app.router.add_post("/api/sessions", api._handle_create_session)
+        app.router.add_post("/api/sessions/{session_id}/model", api._handle_session_model_lock)
+        app.router.add_post("/api/sessions/{session_id}/chat", api._handle_session_chat)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/sessions", json=payload, headers=_AUTH)
+            return resp.status, await resp.json()
+
+    return asyncio.run(run())
+
+
+def test_create_then_physical_model_pick_returns_lock_acknowledgement(api, owner):
+    """First-session physical pick: lock acknowledgement, no invented marker work,
+    durable model-lock persistence."""
+    _attach_turn_runner_state(owner)
+    status, _ = _create_session(api, "sess-first-lock")
+    assert status in (200, 201)
+
+    status, payload = asyncio.run(
+        _post_model(api, "sess-first-lock", _PHYSICAL_BODY))
+
+    # Today this is HTTP 500 managed_marker_reconciliation_failed (restore_api_session
+    # raises not_found for the unbound session) — the regression under repair.
+    assert status == 200, payload
+    row = owner.persistence.sessions.get("sess-first-lock")
+    model_config = row.model_config
+    if isinstance(model_config, str):
+        model_config = json.loads(model_config or "{}")
+    assert model_config.get("browser_model_lock", {}).get("model") == "mockinfra-free-model"
+    assert model_config.get("browser_model_lock", {}).get("confirmed") is True
+
+
+def test_create_then_chat_with_model_lock_does_not_refuse_prematurely(api, owner):
+    """First chat with require_model_lock: the lock boundary must not refuse a fresh
+    unbound session with managed_marker_reconciliation_failed; the turn machinery is
+    reached (and is answered by a stub turn here, not a real provider)."""
+    _attach_turn_runner_state(owner)
+    status, _ = _create_session(api, "sess-first-chat")
+    assert status in (200, 201)
+
+    dispatched = []
+
+    async def stub_turn(event):
+        dispatched.append(event)
+        # No provider is contacted by this stub at all.
+        return "ok"
+
+    owner.runner._handle_message = stub_turn
+    status, payload = _post_chat(api, "sess-first-chat", {
+        "message": "hi", "provider": "mockinfra", "model": "mockinfra-free-model",
+        "require_model_lock": True})
+    assert not (isinstance(payload, dict)
+                and payload.get("error", {}).get("code") == "managed_marker_reconciliation_failed"), payload
+    assert status in (200, 201), (status, payload)
+    assert len(dispatched) == 1  # the turn was admitted and dispatched: the lock boundary passed
+
+
+def _post_chat(api, session_id: str, body: dict):
+    async def run():
+        _set_key(api)
+        app = web.Application()
+        app.router.add_post("/api/sessions/{session_id}/chat", api._handle_session_chat)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{session_id}/chat", json=body, headers=_AUTH)
+            try:
+                return resp.status, await resp.json()
+            except Exception:
+                return resp.status, {}
+    return asyncio.run(run())
+

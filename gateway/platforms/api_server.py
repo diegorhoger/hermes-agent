@@ -1935,27 +1935,29 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             session_id, model=model, provider=provider)
         return True, reconcile_failure
 
-    def _authoritative_session_route(self, session_id: str) -> Optional[str]:
-        """The exact canonical route of the API session whose physical model lock was
-        durably committed — resolved through the same active, profile-owned session
-        authority and persisted API binding the turn itself uses, never guessed from a
-        request header or the raw transcript id.
+    def _authoritative_session_route(self, session_id: str) -> tuple[str, Optional[str]]:
+        """One of:
+        ``('bound', route)`` — an authority-bound API session whose canonical route was
+        resolved and re-validated exactly as the turn boundary validates it (``restore_api_session``).
+        ``('new', None)`` — a truly new, unbound, never-admitted session: no receipt and no
+        admission history, so no managed marker can exist; the caller may proceed with nothing
+        to reconcile. ``('legacy', None)`` — in-process embed with no TurnRunner; nothing to do.
 
         The binding lives on the compression root, so a continuation id resolves to its
         root's route. ``restore_api_session`` re-validates the binding receipt, the
         profile, the physical row, the route derivation and the heal replacement exactly
         as the turn boundary does; after a restart it rebuilds the live entry from durable
         state. Any missing, corrupt, mismatched or unreadable authority, binding, receipt
-        or profile raises, and the caller must fail closed rather than clear anything.
-
-        Returns ``None`` only for a legacy in-process embed with no TurnRunner (no managed
-        state exists there).
+        or profile raises, and the caller must fail closed rather than clear anything —
+        in particular, a session with turn history but no binding refuses, and unreadable
+        storage is never an assumption of absence.
         """
         runner = getattr(self, "gateway_runner", None)
         if runner is None:
             # Legacy in-process/non-authority embed: no TurnRunner, no managed sessions.
-            return None
+            return ("legacy", None)
         from gateway.session_authorities import active_authority
+        from gateway.session_persistence import authority_persistence
         authority = active_authority(runner)
         if authority is None:
             from persistence.core.errors import AuthorityRefusal
@@ -1966,14 +1968,37 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             from persistence.core.errors import AuthorityRefusal
             raise AuthorityRefusal('invalid_params')
         root = authority.logical_owner(sid)
-        from gateway.session_api import restore_api_session
-        restore_api_session(authority, root)
-        live = authority.sessions.get(root)
-        route = str(getattr(live, "route", "") or "").strip()
-        if not route:
+        persistence = authority_persistence(authority)
+        try:
+            receipt = persistence.bindings.api_binding(root)
+        except Exception:
+            # An unreadable binding is not an absent one: refuse rather than guess.
+            raise
+        if receipt is not None:
+            from gateway.session_api import restore_api_session
+            restore_api_session(authority, root)
+            live = authority.sessions.get(root)
+            route = str(getattr(live, "route", "") or "").strip()
+            if not route:
+                from persistence.core.errors import AuthorityRefusal
+                raise AuthorityRefusal('admission_conflict')
+            return ("bound", route)
+        # No binding yet. A session created through the create endpoint has none —
+        # its binding comes into being at first-turn admission, inside that
+        # transaction. Only the admission ledger can distinguish that legitimate
+        # fresh state from a previously managed session whose binding is lost:
+        try:
+            prior = persistence.admissions.list(session_id=root, pending_only=False)
+        except Exception:
+            # Unreadable storage is not an assumption of absence: refuse.
+            raise
+        if prior:
             from persistence.core.errors import AuthorityRefusal
             raise AuthorityRefusal('admission_conflict')
-        return route
+        # Truly new, unbound, never admitted: no managed marker can exist (markers
+        # are written by managed turns under this canonical route). The authorized
+        # physical pick may proceed; nothing to reconcile.
+        return ("new", None)
 
     def _reconcile_managed_marker_after_lock(self, session_id: str, *, model: Optional[str],
                                              provider: Optional[str]) -> Optional[str]:
@@ -2007,15 +2032,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if _is_virtual_pick(committed):
             return None
         try:
-            route = self._authoritative_session_route(session_id)
+            kind, route = self._authoritative_session_route(session_id)
         except Exception as exc:
             detail = getattr(exc, "args", [None])
             reason = (detail[0] if detail else None) or str(exc) or type(exc).__name__
             logger.warning("[%s] managed-marker reconciliation refused for %s: the authoritative route is unproven",
                            self.name, session_id, exc_info=True)
             return f"the managed-routing marker could not be attributed to this session ({reason})"
-        if route is None:
-            return None  # legacy in-process embed: nothing to reconcile
+        if kind != "bound":
+            return None  # legacy embed or truly new unbound session: nothing to reconcile
         try:
             present = managed_marker_present(runner, route)
         except Exception as exc:
