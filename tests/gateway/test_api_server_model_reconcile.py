@@ -6,363 +6,439 @@ explicit physical ``/model <model> --session`` pick reconciles the marker at
 the commit boundary. The api_server surface has its own session-pick
 mechanism — ``POST /api/sessions/{session_id}/model`` (a Browser model lock,
 the desktop's pick endpoint) — and an operator who picks a physical model there
-must reconcile the same marker there. Otherwise the session is refused on every
-unpinned turn forever, with no recovery short of another command surface the
-api_server client does not have.
+must reconcile the same marker there, or the session is refused on every
+unpinned turn forever.
 
-These tests drive the real HTTP endpoint (``_handle_session_model_lock``) end
-to end, plus a turn-boundary probe (``pre_turn_route``) to prove the refusal
-exists before the fix and the session routes after it:
+These tests drive the REAL HTTP endpoint end to end against the canonical,
+disposable session-authority machinery (``owner``/``api`` conftest fixtures over
+a fresh profile ``state.db``), with sessions created through the supported host
+binding (``admit_api_turn``) exactly as production turns enter:
 
-- ``test_physical_lock_durably_clears_corrupt_marker``
+- ``test_physical_lock_durably_clears_corrupt_marker_on_authoritative_route``
 - ``test_virtual_autorouter_pick_keeps_the_marker``
 - ``test_marker_clear_failure_is_reported_not_concealed``
-- ``test_unpinned_turns_refuse_before_pick_and_route_after`` (end-to-end recovery proof)
+- ``test_unpinned_turns_refuse_before_pick_with_zero_requests_and_recover_after``
+- ``test_compression_continuation_resolves_to_owner_route``
+- ``test_unrelated_header_key_does_not_clear_another_sessions_marker``
+- ``test_cross_session_isolation``
+- ``test_secondary_profile_session_is_not_visible_to_this_adapter``
+- ``test_unavailable_authority_fails_closed``
+- ``test_restart_restores_session_and_marker_stays_cleared``
 
-Negative controls: refusal turns produce ZERO provider requests (the refusal
-happens before any provider call), and the virtual pick never widens into
-stock semantics.
+The stale-marker refusal happens before any provider request; the recovery is
+observed at the real turn boundary (``pre_turn_route``) on the authoritative
+route, not on a fabricated key.
 """
 
 from __future__ import annotations
 
-import types
+import asyncio
+import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.config import Platform
-from gateway.platforms.api_server import APIServerAdapter
-from gateway.config import PlatformConfig
-from gateway.run import GatewayRunner
 from gateway.session import SessionSource
-from persistence.core.aio import AwaitableStore
+from gateway.session_api_turn import admit_api_turn
+from gateway.config import Platform
 
 
 # ---------------------------------------------------------------------------
-# Fakes: the durable session-store half and the sessions-persistence half.
+# Authority-backed helpers
 # ---------------------------------------------------------------------------
 
-
-class _DurableMarkerStore:
-    """Dict-backed session-store stand-in (marker metadata only) with fault injection."""
-
-    def __init__(self):
-        self.meta: dict[tuple[str, str], object] = {}
-        self.overrides: dict[str, dict] = {}
-        self.fail_clear_marker = False
-        self.clear_marker_returns_false = False
-
-    def get_session_metadata(self, key, k, default=None):
-        return self.meta.get((key, k), default)
-
-    def set_session_metadata(self, key, k, value):
-        if k == "autorouter_managed" and value is None:
-            if self.fail_clear_marker:
-                raise RuntimeError("disk full")
-            if self.clear_marker_returns_false:
-                return False
-            self.meta.pop((key, k), None)
-            return True
-        if value is None:
-            self.meta.pop((key, k), None)
-        else:
-            self.meta[(key, k)] = value
-        return True
-
-    def set_model_override(self, key, override):
-        if override is None:
-            self.overrides.pop(key, None)
-        else:
-            self.overrides[key] = dict(override)
-
-    def get_model_override(self, key):
-        override = self.overrides.get(key)
-        return dict(override) if override else None
+def _bind_api_session(api, session_id: str) -> str:
+    """Create the session through the supported host binding; return its route."""
+    admit_api_turn(api, session_id=session_id, request_id=f"req-{session_id}",
+                   user_message="hello", conversation_history=[])
+    from gateway.session_authorities import active_authority
+    authority = active_authority(api.gateway_runner)
+    return authority.sessions[session_id].route
 
 
-class _FakeConversation:
-    def __init__(self):
-        self.autorouter_managed = None
-        self.model_override = None
+def _attach_turn_runner_state(owner) -> dict:
+    """Give the authority's bare test runner the session-state accessors the turn
+    boundary and the marker helpers use, with a disposable in-memory map."""
+    states: dict[str, object] = {}
+
+    def _peek(key):
+        return states.get(key)
+
+    def _state(key):
+        return states.setdefault(
+            key, SimpleNamespace(conversation=SimpleNamespace(model_override=None,
+                                                              autorouter_managed=None)))
+
+    owner.runner._peek_session_state = _peek
+    owner.runner._session_state = _state
+    owner.runner._evict_cached_agent = lambda _key: None
+    return states
 
 
-class _FakeSessionState:
-    def __init__(self):
-        self.conversation = _FakeConversation()
-
-
-def _make_runner(marker_store: _DurableMarkerStore) -> GatewayRunner:
-    runner = object.__new__(GatewayRunner)
-    runner.adapters = {}
-    runner.session_store = marker_store
-    runner._session_model_overrides = {}
-    runner._sessions = {}
-    runner._peek_session_state = lambda key: runner._sessions.get(key)
-    runner._session_state = lambda key: runner._sessions.setdefault(key, _FakeSessionState())
-    runner._evict_cached_agent = lambda _key: None
-    return runner
-
-
-def _seed_corrupt_marker(runner: GatewayRunner, store: _DurableMarkerStore, key: str) -> None:
+def _seed_corrupt_marker(owner, states, route: str) -> None:
     """The operator's situation: both copies of the managed marker are corrupt."""
-    state = runner._session_state(key)
-    state.conversation.autorouter_managed = "corrupt!!"
-    store.set_session_metadata(key, "autorouter_managed", "corrupt!!")
+    states[route] = SimpleNamespace(conversation=SimpleNamespace(model_override=None,
+                                                                 autorouter_managed="corrupt!!"))
+    owner.runner.session_store.set_session_metadata(route, "autorouter_managed", "corrupt!!")
 
 
-def _make_session_row(session_id: str):
-    return SimpleNamespace(
-        session_id=session_id,
-        source="api_server",
-        user_id="user-1",
-        model=None,
-        title=None,
-        started_at=None,
-        ended_at=None,
-        end_reason=None,
-        message_count=0,
-        tool_call_count=0,
-        input_tokens=0,
-        output_tokens=0,
-        cache_read_tokens=0,
-        cache_write_tokens=0,
-        reasoning_tokens=0,
-        estimated_cost_usd=None,
-        actual_cost_usd=None,
-        api_call_count=0,
-        parent_session_id=None,
-        pinned=False,
-        archived=False,
-        hidden=False,
-        system_prompt=None,
-        model_config={},
-    )
-
-
-class _FakeSessions:
-    def __init__(self, session_id: str):
-        self._session_id = session_id
-        self.runtime_locks: list[tuple[str, object]] = []
-
-    def get(self, session_id):
-        if session_id == self._session_id:
-            return _make_session_row(session_id)
-        return None
-
-    def set_runtime_lock(self, session_id, lock):
-        self.runtime_locks.append((session_id, lock))
-
-
-def _make_adapter() -> APIServerAdapter:
-    config = PlatformConfig(enabled=True, extra={"key": "sk-test"})
-    return APIServerAdapter(config)
-
-
-def _wire_storage(adapter: APIServerAdapter, sessions: _FakeSessions):
-    """Bypass the authority-selected persistence with the fake sessions store."""
-    store = types.SimpleNamespace(
-        aio=AwaitableStore(types.SimpleNamespace(sessions=sessions, executor=None)),
-        sessions=sessions,
-    )
-    adapter._session_db = object()  # explicit override, never the filesystem
-    adapter._store_beside = lambda _db: store
-    return store
-
-
-def _create_app(adapter: APIServerAdapter) -> "web.Application":
-    from aiohttp import web
-
+def _make_app(api) -> web.Application:
     app = web.Application()
-    app["api_server_adapter"] = adapter
-    app.router.add_post("/api/sessions/{session_id}/model", adapter._handle_session_model_lock)
+    app.router.add_post("/api/sessions/{session_id}/model", api._handle_session_model_lock)
     return app
 
 
-def _physical_lock_body():
-    return {"model": "mockinfra-free-model", "provider": "mockinfra"}
+_PHYSICAL_BODY = {"model": "mockinfra-free-model", "provider": "mockinfra"}
+_AUTH = {"Authorization": "Bearer " + "test-key"}
 
 
-def _turn_source() -> SessionSource:
-    return SessionSource(
-        platform=Platform.API_SERVER,
-        chat_id="chat-1",
-        chat_type="dm",
-        user_id="user-1",
-    )
+def _set_key(api):
+    api._api_key = "test-key"
 
 
-def test_physical_lock_durably_clears_corrupt_marker():
-    """A physical pick through the api_server pick endpoint reconciles the marker."""
-    import asyncio
-
-    async def run():
-        adapter = _make_adapter()
-        runner = _make_runner(_DurableMarkerStore())
-        adapter.gateway_runner = runner
-        sessions = _FakeSessions("sess-reconcile")
-        _wire_storage(adapter, sessions)
-        _seed_corrupt_marker(runner, runner.session_store, "sess-reconcile")
-        app = _create_app(adapter)
-
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/api/sessions/sess-reconcile/model",
-                json=_physical_lock_body(),
-                headers={"Authorization": "Bearer sk-test"},
-            )
-        return resp, runner, sessions
-
-    resp, runner, sessions = asyncio.run(run())
-    assert resp.status == 200, getattr(resp, "text", None)
-    # The lock landed durably...
-    assert sessions.runtime_locks and sessions.runtime_locks[0][0] == "sess-reconcile"
-    assert sessions.runtime_locks[0][1].confirmed is True
-    # ...and the corrupt marker is durably reconciled at the same commit boundary.
-    assert runner.session_store.get_session_metadata("sess-reconcile", "autorouter_managed") is None
-    assert runner._sessions["sess-reconcile"].conversation.autorouter_managed is None
+async def _post_model(api, session_id: str, body: dict, headers: dict | None = None):
+    _set_key(api)
+    app = _make_app(api)
+    hdrs = dict(_AUTH)
+    if headers:
+        hdrs.update(headers)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(f"/api/sessions/{session_id}/model", json=body, headers=hdrs)
+        payload = await resp.json()
+        return resp.status, payload
 
 
-def test_virtual_autorouter_pick_keeps_the_marker():
-    """An AutoRouter virtual pick IS the managed binding: the marker stays by design."""
-    import asyncio
-
-    async def run():
-        adapter = _make_adapter()
-        runner = _make_runner(_DurableMarkerStore())
-        adapter.gateway_runner = runner
-        sessions = _FakeSessions("sess-virtual")
-        _wire_storage(adapter, sessions)
-        _seed_corrupt_marker(runner, runner.session_store, "sess-virtual")
-        app = _create_app(adapter)
-
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/api/sessions/sess-virtual/model",
-                json={"model": "auto-free", "provider": "autorouter"},
-                headers={"Authorization": "Bearer sk-test"},
-            )
-        return resp, runner, sessions
-
-    resp, runner, sessions = asyncio.run(run())
-    assert resp.status == 200
-    assert runner.session_store.get_session_metadata("sess-virtual", "autorouter_managed") == "corrupt!!"
+def _turn_source(owner):
+    return SessionSource(platform=Platform.API_SERVER, chat_id="unused",
+                         chat_type="dm", user_id="api", profile=None)
 
 
-def test_marker_clear_failure_is_reported_not_concealed():
-    """If the durable clear cannot land, the endpoint never reports a clean success."""
-    import asyncio
-
-    async def run():
-        adapter = _make_adapter()
-        marker_store = _DurableMarkerStore()
-        marker_store.fail_clear_marker = True
-        runner = _make_runner(marker_store)
-        adapter.gateway_runner = runner
-        sessions = _FakeSessions("sess-broken")
-        _wire_storage(adapter, sessions)
-        _seed_corrupt_marker(runner, marker_store, "sess-broken")
-        app = _create_app(adapter)
-
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/api/sessions/sess-broken/model",
-                json=_physical_lock_body(),
-                headers={"Authorization": "Bearer sk-test"},
-            )
-            body = await resp.json()
-        return resp, body, marker_store
-
-    resp, body, marker_store = asyncio.run(run())
-    assert resp.status == 500
-    assert body["error"]["code"] == "managed_marker_reconciliation_failed"
-    assert "marker" in body["error"]["message"]
-    # The lock did land (the persist half is independent); the failure names the reconcile half.
-    assert marker_store.get_session_metadata("sess-broken", "autorouter_managed") == "corrupt!!"
-
-
-def test_unpinned_turns_refuse_before_pick_and_route_after():
-    """End-to-end recovery: refuses with ZERO provider requests before, recovers after."""
-    import asyncio
-
+def _turn(owner, route: str):
     from gateway.autorouter_turn import pre_turn_route
+    return pre_turn_route(
+        runner=owner.runner, source=_turn_source(owner), session_key=route,
+        user_config={}, model="stock-model",
+        runtime_kwargs={"provider": "stock-provider"})
 
-    marker_store = _DurableMarkerStore()
-    runner = _make_runner(marker_store)
-    _seed_corrupt_marker(runner, marker_store, "sess-recovery")
 
-    refusal_text = None
+@pytest.fixture
+def consumer(monkeypatch):
+    """A real pre_inference_route consumer plugin in the test home, with the route
+    resolver stubbed to canned physical kwargs. Yields a recorder of invocations."""
+    import hermes_yaml as yaml
+    calls: list[dict] = []
+
+    source = """
+def register(ctx):
+    def consume(**kwargs):
+        return {'status': 'route', 'provider': 'locala', 'model': 'local-model-a',
+                'reason': 'fixture route'}
+
+    ctx.register_middleware('pre_inference_route', consume)
+"""
+    from pathlib import Path
+    import os
+    home = Path(os.environ["HERMES_HOME"])
+    plugin_dir = home / "plugins" / "autorouter_fixture"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "plugin.yaml").write_text("name: autorouter_fixture\nversion: 0.1.0\n")
+    (plugin_dir / "__init__.py").write_text(source)
+    cfg = yaml.safe_load((home / "config.yaml").read_text()) if (home / "config.yaml").exists() else {}
+    cfg = dict(cfg or {})
+    cfg["plugins"] = {**(cfg.get("plugins") or {}), "enabled": ["autorouter_fixture"]}
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+    from hermes_cli import plugins
+    from hermes_cli.plugins import PluginManager
+    manager = PluginManager()
+    manager.discover_and_load()
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr("gateway.session_policy.policy_for_source", lambda runner, source: None)
+
+    import hermes_cli.middleware as middleware
+    original = middleware.apply_pre_inference_route_middleware
+
+    def recorder(metadata, platform=None):
+        calls.append(dict(metadata))
+        return original(metadata, platform=platform)
+
+    monkeypatch.setattr(middleware, "apply_pre_inference_route_middleware", recorder)
+
+    seen = []
+
+    def fake_resolve(provider, target_model=None):
+        seen.append((provider, target_model))
+        return {"provider": provider, "api_key": f"sk-dummy-{provider}",
+                "base_url": f"http://127.0.0.1:9/{provider}", "api_mode": "chat_completions",
+                "requested_provider": provider, "request_overrides": {}, "capabilities": {}}
+
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", fake_resolve)
+    return calls, seen
+
+
+def test_physical_lock_durably_clears_corrupt_marker_on_authoritative_route(api, owner):
+    """A physical pick through the api_server pick endpoint reconciles the marker
+    belonging to the session's authoritative route — and only that marker."""
+    states = _attach_turn_runner_state(owner)
+    route = _bind_api_session(api, "sess-reconcile")
+    _seed_corrupt_marker(owner, states, route)
+
+    status, payload = asyncio.run(_post_model(api, "sess-reconcile", _PHYSICAL_BODY))
+
+    assert status == 200, payload
+    # The lock landed durably on the picked session's row...
+    row = owner.persistence.sessions.get("sess-reconcile")
+    model_config = row.model_config
+    if isinstance(model_config, str):
+        model_config = json.loads(model_config or "{}")
+    assert model_config.get("browser_model_lock", {}).get("model") == "mockinfra-free-model"
+    assert model_config.get("browser_model_lock", {}).get("confirmed") is True
+    # ...and the corrupt marker is durably reconciled at the same commit boundary.
+    assert owner.runner.session_store.get_session_metadata(route, "autorouter_managed") is None
+    assert states[route].conversation.autorouter_managed is None
+
+
+def test_virtual_autorouter_pick_keeps_the_marker(api, owner):
+    """An AutoRouter virtual pick IS the managed binding: the marker stays by design."""
+    states = _attach_turn_runner_state(owner)
+    route = _bind_api_session(api, "sess-virtual")
+    _seed_corrupt_marker(owner, states, route)
+
+    status, payload = asyncio.run(
+        _post_model(api, "sess-virtual", {"model": "auto-free", "provider": "autorouter"}))
+
+    assert status == 200, payload
+    assert owner.runner.session_store.get_session_metadata(route, "autorouter_managed") == "corrupt!!"
+    assert states[route].conversation.autorouter_managed == "corrupt!!"
+
+
+def test_marker_clear_failure_is_reported_not_concealed(api, owner, monkeypatch):
+    """If the durable clear cannot land, the endpoint never reports a clean success."""
+    states = _attach_turn_runner_state(owner)
+    route = _bind_api_session(api, "sess-broken")
+    _seed_corrupt_marker(owner, states, route)
+
+    store = owner.runner.session_store
+    original = store.set_session_metadata
+
+    def boom(key, name, value):
+        if name == "autorouter_managed" and value is None:
+            raise RuntimeError("disk full")
+        return original(key, name, value)
+
+    monkeypatch.setattr(store, "set_session_metadata", boom)
+
+    status, payload = asyncio.run(_post_model(api, "sess-broken", _PHYSICAL_BODY))
+
+    assert status == 500
+    assert payload["error"]["code"] == "managed_marker_reconciliation_failed"
+    assert "marker" in payload["error"]["message"]
+    # The physical lock itself landed (it is independent of reconciliation)...
+    row = owner.persistence.sessions.get("sess-broken")
+    model_config = row.model_config
+    if isinstance(model_config, str):
+        model_config = json.loads(model_config or "{}")
+    assert model_config.get("browser_model_lock", {}).get("model") == "mockinfra-free-model"
+    # ...and the marker is honestly reported as not reconciled.
+    assert store.get_session_metadata(route, "autorouter_managed") == "corrupt!!"
+
+
+def test_unpinned_turns_refuse_before_pick_with_zero_requests_and_recover_after(api, owner, consumer):
+    """End-to-end recovery through the real binding and turn boundary.
+
+    Before the pick: the turn boundary refuses BEFORE the consumer is consulted and
+    before any route is resolved to a physical runtime — zero provider requests.
+    After the pick: the boundary routes through the consumer exactly once.
+    """
+    calls, seen = consumer
+    states = _attach_turn_runner_state(owner)
+    route = _bind_api_session(api, "sess-recovery")
+    _seed_corrupt_marker(owner, states, route)
+
+    from gateway.autorouter_turn import AutoRouterRefusal
+    with pytest.raises(AutoRouterRefusal):
+        _turn(owner, route)
+    assert calls == []  # the routing consumer was never consulted
+    assert seen == []   # no provider route was resolved
+
+    status, payload = asyncio.run(_post_model(api, "sess-recovery", _PHYSICAL_BODY))
+    assert status == 200, payload
+
+    model, kwargs, applied = _turn(owner, route)
+    assert applied == "ordinary"
+    assert model == "local-model-a"
+    assert len(calls) == 1
+    assert calls[0]["session_id"] == route[:256]
+    assert calls[0]["platform"] == "api_server"
+    assert calls[0]["requested_model"] == "stock-model"
+    assert calls[0]["requested_provider"] == "stock-provider"
+    assert calls[0]["explicit_model"] is False
+    assert seen == [("locala", "local-model-a")]
+
+
+def test_compression_continuation_resolves_to_owner_route(api, owner):
+    """A compression continuation id still reconciles the OWNER route the turn uses."""
+    from persistence.conversation.lineage import CompressionChild
+    from persistence.conversation.messages import NewMessage
+
+    states = _attach_turn_runner_state(owner)
+    admit_api_turn(api, session_id="root", request_id="first",
+                   user_message="hello", conversation_history=[])
+    owner.persistence.lineage.publish_compression_child(
+        "root", CompressionChild(session_id="tip", source="api_server"),
+        [NewMessage.from_live({"role": "assistant", "content": "summary"})],
+        require_compression_lease=False)
+    owner.runner.session_store.advance_compression_session(owner.sessions["root"].route, "root", "tip")
+    route = owner.sessions["root"].route
+    _seed_corrupt_marker(owner, states, route)
+
+    # The operator picks through the endpoint naming the continuation id...
+    status, payload = asyncio.run(_post_model(api, "tip", _PHYSICAL_BODY))
+    assert status == 200, payload
+    # ...and the marker belonging to the compression root's authoritative route is cleared.
+    assert owner.runner.session_store.get_session_metadata(route, "autorouter_managed") is None
+    assert states[route].conversation.autorouter_managed is None
+
+
+def test_unrelated_header_key_does_not_clear_another_sessions_marker(api, owner):
+    """A client-supplied X-Hermes-Session-Key is not ownership proof: when the header
+    names another live session's route, that session's marker survives this pick
+    untouched. Client headers never widen the reconciliation boundary."""
+    states = _attach_turn_runner_state(owner)
+    route_a = _bind_api_session(api, "sess-header-target")
+    route_b = _bind_api_session(api, "sess-header-other")  # another session, same store
+    assert route_a != route_b
+    _seed_corrupt_marker(owner, states, route_b)
+    _seed_corrupt_marker(owner, states, route_a)
+
+    # The client names B's route in the header — a live session entry with a corrupt marker.
+    status, payload = asyncio.run(
+        _post_model(api, "sess-header-target", _PHYSICAL_BODY,
+                    headers={"X-Hermes-Session-Key": route_b}))
+
+    assert status == 200, payload
+    assert owner.runner.session_store.get_session_metadata(route_b,
+                                                            "autorouter_managed") == "corrupt!!"
+    assert states[route_b].conversation.autorouter_managed == "corrupt!!"
+    assert owner.runner.session_store.get_session_metadata(route_a, "autorouter_managed") is None
+
+
+def test_cross_session_isolation(api, owner):
+    """Session B's marker is not reconciled by session A's physical pick."""
+    states = _attach_turn_runner_state(owner)
+    route_a = _bind_api_session(api, "sess-isolation-a")
+    route_b = _bind_api_session(api, "sess-isolation-b")
+    assert route_a != route_b
+    _seed_corrupt_marker(owner, states, route_a)
+    _seed_corrupt_marker(owner, states, route_b)
+
+    status, payload = asyncio.run(_post_model(api, "sess-isolation-a", _PHYSICAL_BODY))
+
+    assert status == 200, payload
+    assert owner.runner.session_store.get_session_metadata(route_a, "autorouter_managed") is None
+    assert owner.runner.session_store.get_session_metadata(route_b, "autorouter_managed") == "corrupt!!"
+    assert states[route_b].conversation.autorouter_managed == "corrupt!!"
+
+
+def test_secondary_profile_session_is_not_visible_to_this_adapter(api, owner, tmp_path, monkeypatch):
+    """A session bound under a secondary profile's authority cannot be seen — let alone
+    locked or reconciled — by this profile's adapter: the lookup fails closed and the
+    secondary profile's marker is untouched."""
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from gateway.session_authority import SessionAuthority
+    from persistence_assembly import open_persistence, profile_scope
+
+    # A second, independent profile (secondary home) with its own authority and DB.
+    secondary_home = tmp_path / "secondary"
+    secondary_home.mkdir()
+    secondary_persistence = open_persistence(profile_scope(home=secondary_home))
+    secondary_store = SessionStore(config=GatewayConfig(), sessions_dir=secondary_home / "sessions")
+    secondary_store._db = secondary_persistence
+    secondary_store._persistence_beside = lambda pinned: pinned
+    secondary_runner = SimpleNamespace(_draining=False, session_store=secondary_store)
+    secondary = SessionAuthority(secondary_runner, profile_id="secondary", instance_id="first",
+                                 epoch=secondary_persistence.runtime.begin_epoch(instance_id="first"),
+                                 persistence=secondary_persistence)
+    secondary_runner.session_authority = secondary
+
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.config import PlatformConfig
+    secondary_adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    secondary_adapter.gateway_runner = secondary_runner
+    secondary_adapter._session_db = secondary_persistence
+    secondary_runner._adapter_for_source = lambda source: secondary_adapter
+    monkeypatch.setenv("HERMES_HOME", str(secondary_home))
+    secondary_states = _attach_turn_runner_state(secondary)
+    route = _bind_api_session(secondary_adapter, "sess-secondary")
+    _seed_corrupt_marker(secondary, secondary_states, route)
+    secondary_persistence_marker = secondary_store.get_session_metadata(route, "autorouter_managed")
+
+    # This profile's adapter, scoped to the launch home, is asked for the secondary's session.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    status, payload = asyncio.run(_post_model(api, "sess-secondary", _PHYSICAL_BODY))
+
+    assert status in (404, 500), (status, payload)
+    assert secondary_store.get_session_metadata(route, "autorouter_managed") == secondary_persistence_marker == "corrupt!!"
+    secondary_persistence.close()
+
+
+def test_unavailable_authority_fails_closed(api, owner, monkeypatch):
+    """Missing authority must fail closed: the lock lands, the marker is not cleared,
+    and the endpoint says so — never a silent 200."""
+    states = _attach_turn_runner_state(owner)
+    route = _bind_api_session(api, "sess-parked")
+    _seed_corrupt_marker(owner, states, route)
+
+    # The persisted API binding that authorizes this session to reconcile cannot be
+    # resolved: the host binding refuses. Ownership is unproven -> fail closed.
+    from persistence.core.errors import AuthorityRefusal
+    import gateway.session_api as session_api
+
+    def refusing_restore(authority, session_id):
+        raise AuthorityRefusal("not_found")
+
+    monkeypatch.setattr(session_api, "restore_api_session", refusing_restore)
+
+    status, payload = asyncio.run(_post_model(api, "sess-parked", _PHYSICAL_BODY))
+
+    assert status == 500
+    assert payload["error"]["code"] == "managed_marker_reconciliation_failed"
+    assert owner.runner.session_store.get_session_metadata(route, "autorouter_managed") == "corrupt!!"
+    assert states[route].conversation.autorouter_managed == "corrupt!!"
+
+
+def test_restart_restores_session_and_marker_stays_cleared(api, owner):
+    """Persistence across a simulated restart: the durable receipt rebuilds the live
+    entry and the reconciled marker stays gone."""
+    states = _attach_turn_runner_state(owner)
+    route = _bind_api_session(api, "sess-restart")
+    _seed_corrupt_marker(owner, states, route)
+
+    status, payload = asyncio.run(_post_model(api, "sess-restart", _PHYSICAL_BODY))
+    assert status == 200, payload
+
+    # Simulate a gateway restart: in-memory session state is rebuilt from durable state.
+    owner.sessions.clear()
+    states.clear()
+    from gateway.session_api import restore_api_session
+    ref = restore_api_session(owner, "sess-restart")
+    assert owner.sessions["sess-restart"].route == route
+    assert ref.session_id == "sess-restart"
+    # The marker does not come back after restore, and the boundary routes the turn.
+    assert owner.runner.session_store.get_session_metadata(route, "autorouter_managed") is None
+    states = _attach_turn_runner_state(owner)
+    from gateway.autorouter_turn import AutoRouterRefusal
     try:
-        pre_turn_route(
-            runner=runner,
-            source=_turn_source(),
-            session_key="sess-recovery",
-            user_config=None,
-            model="mockinfra-free-model",
-            runtime_kwargs={"provider": "mockinfra"},
-        )
-    except Exception as exc:
-        refusal_text = str(exc)
-    assert refusal_text and "refused before any provider request" in refusal_text
-
-    adapter = _make_adapter()
-    adapter.gateway_runner = runner
-    sessions = _FakeSessions("sess-recovery")
-    _wire_storage(adapter, sessions)
-    app = _create_app(adapter)
-
-    async def run():
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/api/sessions/sess-recovery/model",
-                json=_physical_lock_body(),
-                headers={"Authorization": "Bearer sk-test"},
-            )
-        return resp
-
-    resp = asyncio.run(run())
-    assert resp.status == 200
-
-    # The unpinned turn after the pick is no longer refused: the managed marker is gone,
-    # so a never-managed-style session evaluates MODE B on the stock path.
-    try:
-        result = pre_turn_route(
-            runner=runner,
-            source=_turn_source(),
-            session_key="sess-recovery",
-            user_config=None,
-            model="mockinfra-free-model",
-            runtime_kwargs={"provider": "mockinfra"},
-        )
-    except Exception as exc:  # pragma: no cover - failure path for clarity
-        pytest.fail(f"recovered session refused again: {exc}")
-    assert result[2] in ("stock", "explicit", "ordinary")
+        _turn(owner, route)
+    except AutoRouterRefusal as exc:  # pragma: no cover - failure path for clarity
+        pytest.fail(f"restored session refused again: {exc}")
 
 
-def test_header_session_key_is_the_marker_key_not_session_id():
-    """The reconciliation clears the key a turn would use (X-Hermes-Session-Key precedence)."""
-    import asyncio
-
-    async def run():
-        adapter = _make_adapter()
-        runner = _make_runner(_DurableMarkerStore())
-        adapter.gateway_runner = runner
-        sessions = _FakeSessions("sess-header")
-        _wire_storage(adapter, sessions)
-        # The managed marker lives under the header key, as a turn with that header writes it.
-        _seed_corrupt_marker(runner, runner.session_store, "channel-key-1")
-        app = _create_app(adapter)
-
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/api/sessions/sess-header/model",
-                json=_physical_lock_body(),
-                headers={"Authorization": "Bearer sk-test", "X-Hermes-Session-Key": "channel-key-1"},
-            )
-        return resp, runner
-
-    resp, runner = asyncio.run(run())
-    assert resp.status == 200
-    assert runner.session_store.get_session_metadata("channel-key-1", "autorouter_managed") is None
+def test_marker_absent_on_authoritative_route_is_not_an_error(api, owner):
+    """A session with no managed marker anywhere reconciles cleanly (nothing to clear)."""
+    _attach_turn_runner_state(owner)
+    route = _bind_api_session(api, "sess-clean")
+    status, payload = asyncio.run(_post_model(api, "sess-clean", _PHYSICAL_BODY))
+    assert status == 200, payload

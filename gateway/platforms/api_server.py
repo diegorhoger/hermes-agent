@@ -1908,8 +1908,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 409, code="model_lock_unavailable")
         return None
 
-    def _persist_session_runtime_lock(self, session_id: str, runtime_request: dict[str, Any],
-                                      marker_keys: tuple[str, ...] = ()) -> tuple[bool, Optional[str]]:
+    def _persist_session_runtime_lock(self, session_id: str, runtime_request: dict[str, Any]) -> tuple[bool, Optional[str]]:
         # Persist only a newly confirmed lock: a reused stored lock must not be rewritten each
         # turn, and a one-off request override must not erase a confirmed lock.
         # Returns ``(persisted, reconciliation_failure)``. ``persisted`` is True when the store
@@ -1933,33 +1932,62 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.warning("[%s] failed to persist session runtime lock for %s", self.name, session_id, exc_info=True)
             return False, None
         reconcile_failure = self._reconcile_managed_marker_after_lock(
-            session_id, model=model, provider=provider, marker_keys=marker_keys)
+            session_id, model=model, provider=provider)
         return True, reconcile_failure
 
-    def _marker_reconcile_keys(self, request: web.Request) -> tuple[str, ...]:
-        """The keys a turn on this request would use, in TurnRunner's precedence:
-        ``X-Hermes-Session-Key`` first, then the session id."""
-        keys: list[str] = []
-        try:
-            header = (request.headers.get("X-Hermes-Session-Key") or "").strip()
-        except Exception:
-            header = ""
-        if header and not re.search(r'[\r\n\x00]', header) and len(header) <= self._MAX_SESSION_HEADER_LEN:
-            keys.append(header)
-        session_id = str(request.match_info.get("session_id") or "").strip()
-        if session_id and session_id not in keys:
-            keys.append(session_id)
-        return tuple(keys)
+    def _authoritative_session_route(self, session_id: str) -> Optional[str]:
+        """The exact canonical route of the API session whose physical model lock was
+        durably committed — resolved through the same active, profile-owned session
+        authority and persisted API binding the turn itself uses, never guessed from a
+        request header or the raw transcript id.
+
+        The binding lives on the compression root, so a continuation id resolves to its
+        root's route. ``restore_api_session`` re-validates the binding receipt, the
+        profile, the physical row, the route derivation and the heal replacement exactly
+        as the turn boundary does; after a restart it rebuilds the live entry from durable
+        state. Any missing, corrupt, mismatched or unreadable authority, binding, receipt
+        or profile raises, and the caller must fail closed rather than clear anything.
+
+        Returns ``None`` only for a legacy in-process embed with no TurnRunner (no managed
+        state exists there).
+        """
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            # Legacy in-process/non-authority embed: no TurnRunner, no managed sessions.
+            return None
+        from gateway.session_authorities import active_authority
+        authority = active_authority(runner)
+        if authority is None:
+            from persistence.core.errors import AuthorityRefusal
+            # Scoped to a home this process does not serve: ownership cannot be proven.
+            raise AuthorityRefusal('profile_mismatch')
+        sid = str(session_id or "").strip()
+        if not sid:
+            from persistence.core.errors import AuthorityRefusal
+            raise AuthorityRefusal('invalid_params')
+        root = authority.logical_owner(sid)
+        from gateway.session_api import restore_api_session
+        restore_api_session(authority, root)
+        live = authority.sessions.get(root)
+        route = str(getattr(live, "route", "") or "").strip()
+        if not route:
+            from persistence.core.errors import AuthorityRefusal
+            raise AuthorityRefusal('admission_conflict')
+        return route
 
     def _reconcile_managed_marker_after_lock(self, session_id: str, *, model: Optional[str],
-                                             provider: Optional[str], marker_keys: tuple[str, ...] = ()) -> Optional[str]:
+                                             provider: Optional[str]) -> Optional[str]:
         """Reconcile the AutoRouter managed marker after an operator durably commits a
         *physical* session model lock — the api_server equivalent of the messaging
         ``/model --session`` commit boundary (:func:`gateway.autorouter_turn.clear_managed_marker_durable`).
 
-        An AutoRouter virtual pick is the managed binding itself, so the marker stays by
-        design. Returns ``None`` when there is nothing to reconcile or every copy cleared;
-        otherwise a failure message the caller must surface — never a silent success.
+        Exactly the marker belonging to this session's authoritative route is cleared —
+        never a header-supplied key, never a bare transcript id, never another session's
+        or another profile's marker. An AutoRouter virtual pick is the managed binding
+        itself, so the marker stays by design. Returns ``None`` when there is nothing to
+        reconcile or the clear landed; otherwise a failure message the caller must surface
+        — never a silent success. Fail closed on any uncertainty: an unproven route is an
+        unproven marker, and leaving it in place only continues fail-closed refusal.
         """
         runner = getattr(self, "gateway_runner", None)
         if runner is None:
@@ -1978,29 +2006,32 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         committed = {"model": model or "", "provider": provider or ""}
         if _is_virtual_pick(committed):
             return None
-        keys: list[str] = []
-        for key in (*marker_keys, session_id):
-            key = str(key or "").strip()
-            if key and key not in keys:
-                keys.append(key)
-        failures: list[str] = []
-        for key in keys:
-            try:
-                present = managed_marker_present(runner, key)
-            except Exception as exc:
-                detail = getattr(exc, "args", [None])
-                failures.append(f"{(detail[0] if detail else None) or exc or type(exc).__name__}")
-                continue
-            if not present:
-                continue  # no managed marker under this key: nothing to clear
-            try:
-                clear_managed_marker_durable(runner, key)
-            except Exception as exc:
-                detail = getattr(exc, "args", [None])
-                failures.append(f"{(detail[0] if detail else None) or exc or type(exc).__name__}")
-        if failures:
-            logger.warning("[%s] managed-marker reconciliation failed for %s: %s", self.name, session_id, failures)
-            return "; ".join(failures)
+        try:
+            route = self._authoritative_session_route(session_id)
+        except Exception as exc:
+            detail = getattr(exc, "args", [None])
+            reason = (detail[0] if detail else None) or str(exc) or type(exc).__name__
+            logger.warning("[%s] managed-marker reconciliation refused for %s: the authoritative route is unproven",
+                           self.name, session_id, exc_info=True)
+            return f"the managed-routing marker could not be attributed to this session ({reason})"
+        if route is None:
+            return None  # legacy in-process embed: nothing to reconcile
+        try:
+            present = managed_marker_present(runner, route)
+        except Exception as exc:
+            detail = getattr(exc, "args", [None])
+            reason = (detail[0] if detail else None) or exc or type(exc).__name__
+            logger.warning("[%s] managed-marker reconciliation failed for %s: %s", self.name, session_id, exc, exc_info=True)
+            return str(reason)
+        if not present:
+            return None  # no managed marker on the authoritative route: nothing to clear
+        try:
+            clear_managed_marker_durable(runner, route)
+        except Exception as exc:
+            detail = getattr(exc, "args", [None])
+            reason = (detail[0] if detail else None) or exc or type(exc).__name__
+            logger.warning("[%s] managed-marker reconciliation failed for %s: %s", self.name, session_id, exc, exc_info=True)
+            return str(reason)
         return None
 
     @staticmethod
@@ -2899,9 +2930,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return None, lock_error
-        marker_keys = self._marker_reconcile_keys(request)
         persisted, reconcile_failure = await asyncio.to_thread(
-            self._persist_session_runtime_lock, session_id, runtime_request, marker_keys)
+            self._persist_session_runtime_lock, session_id, runtime_request)
         if not persisted:
             return None, _error_response(
                 "Could not persist the requested session model lock", 500, code="model_lock_persistence_failed")
@@ -3331,9 +3361,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
-        marker_keys = self._marker_reconcile_keys(request)
         persisted, reconcile_failure = await asyncio.to_thread(
-            self._persist_session_runtime_lock, session_id, runtime_request, marker_keys)
+            self._persist_session_runtime_lock, session_id, runtime_request)
         if not persisted:
             return _error_response(
                 "Could not persist the requested session model lock", 500, code="model_lock_persistence_failed")
