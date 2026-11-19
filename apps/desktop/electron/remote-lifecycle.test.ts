@@ -760,6 +760,30 @@ test.skipIf(process.platform === 'win32')(
         'a duplicate conflicting profile must remain foreign'
       )
 
+      // A nonce or token-path prefix is not ownership. On macOS ps joins
+      // unquoted argv, so the lossy raw-line fallback must still refuse these.
+      const suffixNonce = spawnInstaller([
+        '--profile', 'ops', 'serve', '--isolated',
+        ...backendFlags.slice(0, -1), `${SPAWN_NONCE}extra`
+      ])
+      assert.equal(await waitForEntrypoint(suffixNonce), true)
+      assert.equal(
+        await pidIsOurDashboard(ssh, suffixNonce.pid, SPAWN_NONCE, launcher, '/unrelated/hermes-home', OWNERSHIP_ID, 'ops'),
+        false,
+        'a nonce prefix must not authorize killing an unrelated process'
+      )
+
+      const suffixToken = spawnInstaller([
+        '--profile', 'ops', 'serve', '--isolated',
+        ...backendFlags.map(arg => arg === tokenPath ? `${tokenPath}-different` : arg)
+      ])
+      assert.equal(await waitForEntrypoint(suffixToken), true)
+      assert.equal(
+        await pidIsOurDashboard(ssh, suffixToken.pid, SPAWN_NONCE, launcher, '/unrelated/hermes-home', OWNERSHIP_ID, 'ops'),
+        false,
+        'a token-file path prefix must not establish ownership'
+      )
+
       const serveNamedProfile = spawnInstaller(['--profile', 'serve', 'serve', '--isolated', ...backendFlags])
 
       assert.equal(await waitForEntrypoint(serveNamedProfile), true)
