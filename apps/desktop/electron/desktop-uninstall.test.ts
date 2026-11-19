@@ -225,7 +225,7 @@ test.skipIf(process.platform === 'win32').each(['gui', 'lite', 'full'] as const)
       observed.cwd = fs.realpathSync(observed.cwd)
       assert.deepEqual(observed, {
         argv: ['-m', 'hermes_cli.uninstall', '--mode', mode],
-        home: observed.home,
+        home: root,
         pythonPath: mode === 'gui' ? 'inherited' : `${root}:inherited`,
         cwd: realRoot
       })
