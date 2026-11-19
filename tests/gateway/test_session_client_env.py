@@ -417,10 +417,15 @@ def test_auto_started_gateway_does_not_inherit_client_behaviour_env(tmp_path, mo
     home.mkdir()
     captured = {}
 
-    def popen(command, **kwargs):
+    def capture_spawn_env(command, **kwargs):
+        # On macOS the launcher uses start_gateway_job (launchctl) before the
+        # subprocess fallback. Test the daemon env passed to either boundary,
+        # without invoking a real launch agent or subprocess.
         captured.update(kwargs['env'])
         return SimpleNamespace(pid=1)
-    monkeypatch.setattr(gateway_runtime_start.subprocess, 'Popen', popen)
+
+    monkeypatch.setattr(gateway_runtime_start.subprocess, 'Popen', capture_spawn_env)
+    monkeypatch.setattr(gateway_runtime_start, 'start_gateway_job', capture_spawn_env)
     for name in ('HERMES_EPHEMERAL_SYSTEM_PROMPT', 'HERMES_PREFILL_MESSAGES_FILE', 'HERMES_INFERENCE_PROVIDER',
                  'HERMES_ENABLE_PROJECT_PLUGINS', 'HERMES_TUI_CLIENT_ENV'):
         monkeypatch.setenv(name, 'from-the-first-client')
