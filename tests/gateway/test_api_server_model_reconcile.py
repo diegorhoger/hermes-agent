@@ -156,7 +156,7 @@ def register(ctx):
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
     monkeypatch.setattr("gateway.session_policy.policy_for_source", lambda runner, source: None)
 
-    import hermes_cli.middleware as middleware
+    from hermes_cli import middleware
     original = middleware.apply_pre_inference_route_middleware
 
     def recorder(metadata, platform=None):
@@ -265,7 +265,7 @@ def test_unpinned_turns_refuse_before_pick_with_zero_requests_and_recover_after(
     status, payload = asyncio.run(_post_model(api, "sess-recovery", _PHYSICAL_BODY))
     assert status == 200, payload
 
-    model, kwargs, applied = _turn(owner, route)
+    model, _kwargs, applied = _turn(owner, route)
     assert applied == "ordinary"
     assert model == "local-model-a"
     assert len(calls) == 1
@@ -394,7 +394,7 @@ def test_unavailable_authority_fails_closed(api, owner, monkeypatch):
     # The persisted API binding that authorizes this session to reconcile cannot be
     # resolved: the host binding refuses. Ownership is unproven -> fail closed.
     from persistence.core.errors import AuthorityRefusal
-    import gateway.session_api as session_api
+    from gateway import session_api
 
     def refusing_restore(authority, session_id):
         raise AuthorityRefusal("not_found")
@@ -439,6 +439,6 @@ def test_restart_restores_session_and_marker_stays_cleared(api, owner):
 def test_marker_absent_on_authoritative_route_is_not_an_error(api, owner):
     """A session with no managed marker anywhere reconciles cleanly (nothing to clear)."""
     _attach_turn_runner_state(owner)
-    route = _bind_api_session(api, "sess-clean")
+    _bind_api_session(api, "sess-clean")
     status, payload = asyncio.run(_post_model(api, "sess-clean", _PHYSICAL_BODY))
     assert status == 200, payload
