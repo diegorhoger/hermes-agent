@@ -142,6 +142,13 @@ async def prepare_model(authority, live, payload, prepared):
         # The session stays visibly bound to the operator's pick; the routes it
         # runs are the physical ones resolved by the registered consumer.
         frozen['model'] = {**(frozen.get('model') or {}), 'selection': dict(_autorouter_selection)}
+    else:
+        # apply_model_selection preserves unrelated model keys. A physical pick
+        # or reset must explicitly drop a previous AutoRouter mode marker, or
+        # session.info will keep showing Auto (Free) over the new physical route.
+        selection = (frozen.get('model') or {}).get('selection')
+        if isinstance(selection, dict) and selection.get('mode') == 'autorouter':
+            frozen['model'].pop('selection', None)
     if 'reasoning' in payload:
         # The level picked with the model lands in the same commit (as prepare_reasoning writes it).
         from gateway.session_policy import pin_reasoning_effort
