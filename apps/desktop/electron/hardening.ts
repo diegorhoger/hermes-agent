@@ -393,15 +393,21 @@ function relocatedCredentialStores(): string[] {
         const real = realpathOrNull(path.join(base, rel))
 
         if (real) {
-          stores.push(normalizeSensitivePath(real).replace(/\/+$/, ''))
+          const normalizedReal = normalizeSensitivePath(real).replace(/\/+$/, '')
+          stores.push(normalizedReal)
+          if (normalizedReal.startsWith('/private/')) {
+            stores.push(normalizedReal.slice('/private'.length))
+          } else if (normalizedReal.startsWith('/var/') || normalizedReal.startsWith('/tmp/')) {
+            stores.push(`/private${normalizedReal}`)
+          }
         }
       }
     }
   }
 
-  relocatedStoresCache = { at: now, stores }
+  relocatedStoresCache = { at: now, stores: [...new Set(stores)] }
 
-  return stores
+  return relocatedStoresCache.stores
 }
 
 function hermesCredentialStoreReason(normalized: string): null | string {
