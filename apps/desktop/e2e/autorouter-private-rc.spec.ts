@@ -1178,7 +1178,7 @@ async function runPhysicalProviderErrorCase(args: {
     collectEgressEvidence(mock!, fixture.sandbox.root, 'switching')
   })
 
-  test('accessibility: keyboard-only picker navigation, accessible AutoRouter name, selected-state semantics, focus stability and unavailable-option behavior', async () => {
+  test('accessibility: keyboard-only picker navigation, accessible AutoRouter role/name, focus, and selected state', async () => {
     skipIfInputsMissing()
     requirePrivateRcInputs()
     mock = await startSimpleMock()
@@ -1197,14 +1197,17 @@ async function runPhysicalProviderErrorCase(args: {
     await openModelPickerUi(fixture.page)
     const input = fixture.page.locator('input[placeholder*="Search" i], [cmdk-input], [role="combobox"], input[type="search"]').first()
     await expect(input).toBeVisible({ timeout: 20_000 })
-    const dialog = fixture.page.locator('[role="dialog"], [cmdk-root], [cmdk-overlay], [role="listbox"], [data-slot="popover-content"]').first()
-
-    // Accessible name + role/semantics of the AutoRouter option.
-    const autoByName = fixture.page.getByRole('option', { name: /Auto \(Free\)/i }).first()
-    const autoByText = fixture.page.getByText('Auto (Free)', { exact: true }).first()
-    const optionCount = await autoByName.count().catch(() => 0)
-    const textCount = await autoByText.count().catch(() => 0)
-    expect(optionCount + textCount, 'AutoRouter option must be discoverable by accessible name or visible label').toBeGreaterThan(0)
+    // A visible label is NOT a screen-reader accessible option. The composer
+    // menu uses a Radix menuitem; other hosts can present a Command option.
+    // Require the accessible role AND accessible name in either supported host.
+    const autoOption = fixture.page.getByRole('option', { name: /Auto \(Free\)/i }).first()
+    const autoMenuItem = fixture.page.getByRole('menuitem', { name: /Auto \(Free\)/i }).first()
+    const optionVisible = await autoOption.isVisible().catch(() => false)
+    const menuItemVisible = await autoMenuItem.isVisible().catch(() => false)
+    expect(optionVisible || menuItemVisible,
+      'AutoRouter must be visible with an accessible option/menuitem role and name; plain visible text is insufficient',
+    ).toBe(true)
+    const accessibleItemRole = optionVisible ? 'option' : 'menuitem'
 
     await input.click({ timeout: 10_000 })
     await input.fill('Auto')
@@ -1231,28 +1234,24 @@ async function runPhysicalProviderErrorCase(args: {
     await fixture.page.keyboard.press('Escape').catch(() => undefined)
     await fixture.page.waitForTimeout(300)
     const selectedText = await modelPillText(fixture.page)
+    expect(selectedText, 'Keyboard selection must update the user-visible model pill').toMatch(/auto/i)
     await sendChatAndExpectReply(fixture.page, 'a11y keyboard-selected autorouter turn')
     const wire = chatWire()
     assertNoVirtualModelOnWire(mock!)
     expect(wire.at(-1)?.model).toBe('mockinfra-free-model')
 
-    // Unavailable-option behavior: with chat router disabled the virtual
-    // option is not actionable, while ordinary physical options remain usable.
-    await openModelPickerUi(fixture.page)
-    const search = fixture.page.locator('input[placeholder*="Search" i], [cmdk-input], [role="combobox"]').first()
-    if ((await search.count().catch(() => 0)) > 0) { await search.fill('Auto').catch(() => undefined); await fixture.page.waitForTimeout(600) }
-    const dialogRole = await dialog.count().catch(() => 0)
-    await fixture.page.keyboard.press('Escape').catch(() => undefined)
-
+    // Unavailability at startup has its own separate actionability-gate test.
+    // Do not record that as a behavior proven by this enabled-session test.
     saveEvidence('accessibility-state.json', {
-      accessibleOptionNameFound: optionCount + textCount > 0,
-      optionRole: focusBefore.role,
-      ariaSelected: focusBefore.ariaSelected,
+      accessibleOptionNameFound: true,
+      accessibleItemRole,
+      searchFocusTag: focusBefore.tag,
+      searchFocusRole: focusBefore.role,
+      searchAriaSelected: focusBefore.ariaSelected,
       focusStayedInDialog: focusBefore.inDialog,
       selectedStateText: selectedText,
-      dialogLocatorPresent: dialogRole > 0,
       wireModels: wire.map((r) => r.model),
-      note: 'Keyboard-only ArrowDown/Enter navigation; option exposed with option/combobox semantics; selected state reflected in the model pill; no virtual model reached the wire.',
+      note: 'Automated accessible role/name and keyboard selection asserted; no virtual model reached the mock provider. Full macOS VoiceOver/AX conformance and disabled-state screen-reader announcements remain unverified.',
     })
     await takeEvidenceScreenshot(fixture.page, 'a11y-picker-final.png').catch(() => null)
     collectEgressEvidence(mock!, fixture.sandbox.root, 'accessibility')
