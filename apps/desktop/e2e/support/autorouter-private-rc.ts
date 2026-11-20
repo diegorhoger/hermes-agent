@@ -45,7 +45,7 @@ function verifyArchive(filePath: string): void {
 
 function looksLikePinnedAutorouterSource(dir: string): boolean {
   if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return false
-  return fs.existsSync(path.join(dir, 'plugin.yaml')) || fs.existsSync(path.join(dir, '__init__.py'))
+  return fs.existsSync(path.join(dir, 'plugin.yaml')) && fs.existsSync(path.join(dir, '__init__.py'))
 }
 
 function findExtractedSourceRoot(extractDir: string): string {
@@ -67,6 +67,9 @@ export function resolvePinnedAutorouterSource(): string {
 
   const sourceDirEnv = (process.env.AUTOROUTER_PINNED_SOURCE_DIR || '').trim()
   if (sourceDirEnv) {
+    if (isPrivateRcAcceptanceMode()) {
+      throw new Error('Private RC acceptance requires SHA256-verified pinned archive; AUTOROUTER_PINNED_SOURCE_DIR is not authenticated')
+    }
     const resolved = path.resolve(sourceDirEnv)
     if (!looksLikePinnedAutorouterSource(resolved)) {
       throw new Error(
@@ -127,6 +130,7 @@ export function getMissingPrivateRcInputsReason(): string | null {
     if (!fs.existsSync(PREPARE_AUTOROUTER_HOME_SCRIPT)) return `prepare_autorouter_home.py missing: ${PREPARE_AUTOROUTER_HOME_SCRIPT}`
     const sourceDirEnv = (process.env.AUTOROUTER_PINNED_SOURCE_DIR || '').trim()
     if (sourceDirEnv) {
+      if (isPrivateRcAcceptanceMode()) return 'AUTOROUTER_PINNED_SOURCE_DIR is not authenticated in private RC acceptance mode; use the pinned archive'
       const resolved = path.resolve(sourceDirEnv)
       if (!looksLikePinnedAutorouterSource(resolved)) return `AUTOROUTER_PINNED_SOURCE_DIR invalid: ${resolved}`
       return null
