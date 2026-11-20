@@ -291,3 +291,32 @@ def test_resolve_for_turn_prefers_virtual_pick_over_pre_inference(monkeypatch):
     )
     assert model == "physical-model"
     assert called["pre"] == 0
+
+
+def test_gateway_runtime_conversion_failure_never_falls_back_to_raw_fields(monkeypatch):
+    """A failed canonical runtime conversion cannot be bypassed by raw kwargs."""
+    monkeypatch.setattr("hermes_cli.plugins.has_middleware", lambda name: True)
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_pre_inference_route_middleware",
+        lambda metadata, platform=None: _Route(
+            "route", provider="mockinfra", model="mockinfra-free-model",
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested, target_model: _physical_runtime(provider=requested, model=target_model),
+    )
+
+    def reject_runtime(runtime):
+        raise ValueError("invalid canonical runtime conversion")
+
+    monkeypatch.setattr("gateway.run._runtime_agent_kwargs", reject_runtime)
+    with pytest.raises(RuntimeError, match="routed provider is not usable"):
+        mod.apply_pre_inference_route_turn(
+            model="default-model",
+            runtime_kwargs={"provider": "mockinfra"},
+            session_id="s1",
+            session_key="k1",
+            platform="gateway",
+            has_explicit_model_or_provider=False,
+        )
