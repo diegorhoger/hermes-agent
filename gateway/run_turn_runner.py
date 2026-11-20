@@ -1478,24 +1478,20 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 # must not be rewritten by ordinary-session pre-inference routing. The profile's
                 # configured/default model is represented by policy config/default resolution, not by
                 # an explicit request field, so Mode B can still route ordinary sessions.
-                try:
-                    _follows_profile = bool(getattr(policy, "follows_profile", False))
-                except Exception:
-                    _follows_profile = False
                 if isinstance(_req, dict):
                     _req_model = _req.get("model")
                     _req_provider = _req.get("provider")
                     _req_model_requested = _req.get("model_requested")
+                    _req_base_url = _req.get("base_url")
                     _policy_explicit = bool(
                         (isinstance(_req_model, str) and _req_model.strip())
                         or (isinstance(_req_provider, str) and _req_provider.strip() and _req_provider.strip().lower() != "auto")
                         or (isinstance(_req_model_requested, str) and _req_model_requested.strip())
+                        or (isinstance(_req_base_url, str) and _req_base_url.strip())
                     )
-                # follow_profile_config sessions re-read the profile's current route each turn;
-                # an initial model field may be present but should not block profile-following
-                # Mode B routing unless a stronger explicit/runtime override exists.
-                if _follows_profile and not _session_override and not _one_turn_override:
-                    _policy_explicit = False
+                # Following a profile does not cancel an explicit session-create pick.
+                # build_policy records those choices in request_json even when the
+                # followed profile later changes. Preserve request authority here.
             # Runtime/session-explicit picks must never be rewritten by ordinary-session pre-inference
             # routing. Explicitly selected session policy models/providers are authoritative; ordinary
             # configured/default sessions remain routable in Mode B.
