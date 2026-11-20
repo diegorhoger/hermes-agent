@@ -68,11 +68,42 @@ def has_explicit_request_route(request_json: str | None) -> bool:
     return request_route_authority(request_json) != "ordinary"
 
 
+def api_turn_has_explicit_route_authority(settings: Any) -> bool:
+    """An API admission's requested runtime/model outranks ordinary auto-routing.
+
+    API settings are stored separately from session-create request_json, so a
+    gateway turn cannot infer API model authority from the frozen policy alone.
+    Most API admissions carry every settings key with a None value.
+    """
+    if settings is None:
+        return False
+    if not isinstance(settings, dict):
+        return True  # malformed authority input: never grant route rewriting
+    if settings.get("confirmed_runtime_lock"):
+        return True
+    for key in ("requested_model", "requested_provider", "route", "session_model", "requested_runtime"):
+        value = settings.get(key)
+        if value is None:
+            continue
+        if key == "requested_provider" and isinstance(value, str) and value.strip().lower() == "auto":
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif isinstance(value, dict):
+            if value:
+                return True
+        else:
+            return True  # unexpected type: preserve authority, do not rewrite
+    return False
+
+
 def turn_has_explicit_route_authority(
     *,
     request_json: str | None,
     session_model_override: Any = None,
     one_turn_override: Any = None,
+    api_settings: Any = None,
 ) -> bool:
     """Single owner of turn route authority precedence.
 
@@ -84,6 +115,7 @@ def turn_has_explicit_route_authority(
     return bool(
         session_model_override
         or one_turn_override
+        or api_turn_has_explicit_route_authority(api_settings)
         or has_explicit_request_route(request_json)
     )
 
