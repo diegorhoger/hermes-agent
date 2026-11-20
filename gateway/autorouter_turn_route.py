@@ -14,6 +14,118 @@ from typing import Any, Optional
 log = logging.getLogger(__name__)
 
 
+def request_route_authority(request_json: str | None) -> str:
+    """Classify the route authority carried by a frozen session-create request.
+
+    ``build_policy`` records the client's create fields verbatim in
+    ``request_json``; a later session model switch stamps ``model_requested``
+    there too. This is the only place that decides whether a session picked its
+    own route, so it must stay independent of the profile the session follows:
+    a followed profile can change underneath a still-authoritative create pick.
+
+    Returns one of:
+      * ``"explicit"`` — a model, non-auto provider, endpoint or recorded model
+        switch is present; the user's route is authoritative.
+      * ``"ordinary"`` — the request is readable and carries no route pick;
+        ordinary-session pre-inference routing (Mode B) remains eligible.
+      * ``"unavailable"`` — authority metadata is malformed or is not a JSON
+        object. Callers must not treat this as grounds to rewrite the route.
+    """
+    text = request_json if isinstance(request_json, str) else ""
+    text = text.strip() or "{}"
+    try:
+        import json
+
+        req = json.loads(text)
+    except Exception:
+        return "unavailable"
+    if not isinstance(req, dict):
+        return "unavailable"
+
+    # A persisted request that names a route field with an unexpected type
+    # has unknown authority. Do not mistake corruption for an ordinary turn.
+    for field in ("model", "provider", "model_requested", "base_url"):
+        value = req.get(field)
+        if value is not None and not isinstance(value, str):
+            return "unavailable"
+    model = req.get("model")
+    provider = req.get("provider")
+    model_requested = req.get("model_requested")
+    base_url = req.get("base_url")
+    explicit = bool(
+        (isinstance(model, str) and model.strip())
+        or (
+            isinstance(provider, str)
+            and provider.strip()
+            and provider.strip().lower() != "auto"
+        )
+        or (isinstance(model_requested, str) and model_requested.strip())
+        or (isinstance(base_url, str) and base_url.strip())
+    )
+    return "explicit" if explicit else "ordinary"
+
+
+def has_explicit_request_route(request_json: str | None) -> bool:
+    """True when a create request carries an authoritative route pick.
+
+    Unreadable authority metadata fails closed: it is never an invitation for
+    AutoRouter to rewrite a route whose provenance cannot be established.
+    """
+    return request_route_authority(request_json) != "ordinary"
+
+
+def api_turn_has_explicit_route_authority(settings: Any) -> bool:
+    """An API admission's requested runtime/model outranks ordinary auto-routing.
+
+    API settings are stored separately from session-create request_json, so a
+    gateway turn cannot infer API model authority from the frozen policy alone.
+    Most API admissions carry every settings key with a None value.
+    """
+    if settings is None:
+        return False
+    if not isinstance(settings, dict):
+        return True  # malformed authority input: never grant route rewriting
+    if settings.get("confirmed_runtime_lock"):
+        return True
+    for key in ("requested_model", "requested_provider", "route", "session_model", "requested_runtime"):
+        value = settings.get(key)
+        if value is None:
+            continue
+        if key == "requested_provider" and isinstance(value, str) and value.strip().lower() == "auto":
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif isinstance(value, dict):
+            if value:
+                return True
+        else:
+            return True  # unexpected type: preserve authority, do not rewrite
+    return False
+
+
+def turn_has_explicit_route_authority(
+    *,
+    request_json: str | None,
+    session_model_override: Any = None,
+    one_turn_override: Any = None,
+    api_settings: Any = None,
+) -> bool:
+    """Single owner of turn route authority precedence.
+
+    A user-selected create request, a committed session model switch, or a
+    one-turn override each make the route authoritative. Any of them prevents
+    ordinary-session pre-inference routing from rewriting the model, provider
+    or endpoint. Unreadable request metadata fails closed.
+    """
+    return bool(
+        session_model_override
+        or one_turn_override
+        or api_turn_has_explicit_route_authority(api_settings)
+        or has_explicit_request_route(request_json)
+    )
+
+
 def _bounded(value: Any, limit: int) -> str:
     text = str(value if value is not None else "")
     text = "".join(char for char in text if ord(char) >= 32 and ord(char) != 127)
@@ -89,8 +201,19 @@ def resolve_autorouter_virtual_turn(
     resolved_kwargs["requested_provider"] = (
         physical_runtime.get("requested_provider") or receipt.get("provider") or resolved_kwargs.get("requested_provider")
     )
-    resolved_model = receipt.get("model") or physical_runtime.get("model") or model
-    return str(resolved_model), resolved_kwargs
+    resolved_model = receipt.get("model") or physical_runtime.get("model")
+    resolved_provider = resolved_kwargs.get("provider")
+    # Never fall back to the ORIGINAL virtual model identifier. A malformed
+    # consumer/receipt must refuse before constructing an inference client.
+    if (
+        not isinstance(resolved_model, str)
+        or not resolved_model.strip()
+        or not isinstance(resolved_provider, str)
+        or not resolved_provider.strip()
+        or is_autorouter_pick(resolved_model, resolved_provider)
+    ):
+        raise RuntimeError("AutoRouter selection refused before provider request: incomplete physical route")
+    return resolved_model.strip(), resolved_kwargs
 
 
 def apply_pre_inference_route_turn(

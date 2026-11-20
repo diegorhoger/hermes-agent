@@ -22,6 +22,17 @@ class _Route:
         self.reason = reason
 
 
+def _is_virtual_pick(model, provider):
+    """Realistic virtual-pick detector: only a virtual id/provider is a pick.
+
+    A blanket `True` here would make the resolved physical model itself look
+    virtual and trip the incomplete-physical-route safety guard.
+    """
+    m = str(model or "").strip().lower()
+    p = str(provider or "").strip().lower()
+    return m in {"auto-free", "autorouter/auto-free"} or p == "autorouter"
+
+
 def _physical_runtime(provider="mockinfra", model="mockinfra-free-model"):
     return {
         "provider": provider,
@@ -55,7 +66,7 @@ def test_virtual_pick_not_detected_returns_none(monkeypatch):
 
 
 def test_virtual_pick_not_actionable_refuses(monkeypatch):
-    monkeypatch.setattr("hermes_cli.autorouter_picker.is_autorouter_pick", lambda m, p: True)
+    monkeypatch.setattr("hermes_cli.autorouter_picker.is_autorouter_pick", _is_virtual_pick)
     monkeypatch.setattr("hermes_cli.autorouter_picker.actionable", lambda: False)
     monkeypatch.setattr("hermes_cli.autorouter_picker.gate_reason", lambda: "chat router disabled")
     with pytest.raises(RuntimeError, match="chat router disabled"):
@@ -69,7 +80,7 @@ def test_virtual_pick_not_actionable_refuses(monkeypatch):
 
 
 def test_virtual_pick_resolves_to_physical_route(monkeypatch):
-    monkeypatch.setattr("hermes_cli.autorouter_picker.is_autorouter_pick", lambda m, p: True)
+    monkeypatch.setattr("hermes_cli.autorouter_picker.is_autorouter_pick", _is_virtual_pick)
     monkeypatch.setattr("hermes_cli.autorouter_picker.actionable", lambda: True)
 
     def fake_resolve(*, session_id, platform):
@@ -93,7 +104,7 @@ def test_virtual_pick_resolves_to_physical_route(monkeypatch):
 
 
 def test_virtual_pick_resolver_failure_refuses(monkeypatch):
-    monkeypatch.setattr("hermes_cli.autorouter_picker.is_autorouter_pick", lambda m, p: True)
+    monkeypatch.setattr("hermes_cli.autorouter_picker.is_autorouter_pick", _is_virtual_pick)
     monkeypatch.setattr("hermes_cli.autorouter_picker.actionable", lambda: True)
 
     def boom(*, session_id, platform):
@@ -111,7 +122,7 @@ def test_virtual_pick_resolver_failure_refuses(monkeypatch):
 
 
 def test_virtual_pick_requires_stable_binding(monkeypatch):
-    monkeypatch.setattr("hermes_cli.autorouter_picker.is_autorouter_pick", lambda m, p: True)
+    monkeypatch.setattr("hermes_cli.autorouter_picker.is_autorouter_pick", _is_virtual_pick)
     monkeypatch.setattr("hermes_cli.autorouter_picker.actionable", lambda: True)
     with pytest.raises(RuntimeError, match="no stable session binding"):
         mod.resolve_autorouter_virtual_turn(
@@ -319,4 +330,20 @@ def test_gateway_runtime_conversion_failure_never_falls_back_to_raw_fields(monke
             session_key="k1",
             platform="gateway",
             has_explicit_model_or_provider=False,
+        )
+
+
+def test_virtual_selection_refuses_incomplete_physical_route(monkeypatch):
+    """A malformed producer receipt cannot send 'auto-free' on the wire."""
+    monkeypatch.setattr("hermes_cli.autorouter_picker.is_autorouter_pick",
+                        lambda model, provider: model in {"auto-free", "autorouter/auto-free"} or provider == "autorouter")
+    monkeypatch.setattr("hermes_cli.autorouter_picker.actionable", lambda: True)
+    monkeypatch.setattr(
+        "hermes_cli.autorouter_picker.resolve_autorouter_physical",
+        lambda **kwargs: ({"provider": "mockinfra", "base_url": "http://127.0.0.1:9999/v1"}, {"provider": "mockinfra"}),
+    )
+    with pytest.raises(RuntimeError, match="incomplete physical route"):
+        mod.resolve_autorouter_virtual_turn(
+            model="auto-free", runtime_kwargs={"provider": "autorouter"},
+            session_id="s1", session_key="k1", platform="gateway",
         )
