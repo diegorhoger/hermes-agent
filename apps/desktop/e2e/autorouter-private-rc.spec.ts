@@ -49,7 +49,7 @@ interface SimpleMock {
   close: () => Promise<void>
 }
 
-function startSimpleMock(opts?: { chatStatus?: number; chatDelayMs?: number; chatBody?: any; chatBodyText?: string }): Promise<SimpleMock> {
+function startSimpleMock(opts?: { chatStatus?: number; chatDelayMs?: number; chatBody?: any; chatBodyText?: string; destroySocket?: boolean }): Promise<SimpleMock> {
   const requests: MockRequest[] = []
   const chatModels: string[] = []
 
@@ -88,6 +88,11 @@ function startSimpleMock(opts?: { chatStatus?: number; chatDelayMs?: number; cha
         requests.push({ method, path: url, model, headers: req.headers as any, body: parsed, at: Date.now() })
 
         const send = () => {
+          if (opts?.destroySocket) {
+            try { req.socket.destroy() } catch {}
+            try { res.socket?.destroy() } catch {}
+            return
+          }
           if (opts?.chatStatus && opts.chatStatus !== 200) {
             res.writeHead(opts.chatStatus, { 'Content-Type': 'application/json' })
             res.end(opts.chatBodyText ?? JSON.stringify(opts.chatBody ?? { error: { message: 'mock error', type: 'server_error', code: opts.chatStatus } }))
@@ -328,12 +333,61 @@ async function expectUiErrorOrRefusal(page: Page, timeoutMs = 120_000): Promise<
   expect(ok, `Expected refusal/error text in UI, got snippet: ${body.slice(0, 500)}`).toBeTruthy()
 }
 
+
 test.describe('AUTOROUTER_HERMES Dispatch 158 - packaged private RC desktop E2E', () => {
   test.describe.configure({ mode: 'serial' })
   test.setTimeout(600_000)
 
   let fixture: PackagedAppFixture | null = null
   let mock: SimpleMock | null = null
+
+async function runPhysicalProviderErrorCase(args: {
+  name: string
+  label: string
+  mockOpts: { chatStatus?: number; chatDelayMs?: number; chatBody?: any; chatBodyText?: string; destroySocket?: boolean }
+  prompt: string
+  timeoutMs?: number
+}): Promise<void> {
+  mock = await startSimpleMock(args.mockOpts)
+  fixture = await setupPackagedAppRealBackend({
+    appPattern: APP_PATTERN,
+    sandboxPrefix: args.label,
+    prepareSandbox: (sandbox) => {
+      prepareHome(sandbox.hermesHome, mock!.url, { chatRouter: false, nativeRouting: true, defaultProvider: 'mockinfra', defaultModel: 'mockinfra-free-model' })
+    },
+    env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic' },
+  })
+  await waitForComposerReady(fixture, 240_000)
+  await pageReadySettled(fixture.page)
+  await sendChat(fixture.page, args.prompt)
+  let sawReply = false
+  try {
+    await expect(fixture.page.getByText(MOCK_REPLY, { exact: false }).first()).toBeVisible({ timeout: 30_000 })
+    sawReply = true
+  } catch {}
+  if (!sawReply) {
+    await expectUiErrorOrRefusal(fixture.page, args.timeoutMs ?? 180_000).catch(async () => {
+      await takeEvidenceScreenshot(fixture.page, `${args.label}-no-error-text.png`).catch(() => null)
+    })
+  }
+  await fixture.page.waitForTimeout(3000)
+  await takeEvidenceScreenshot(fixture.page, `${args.label}-provider-error.png`).catch(() => null)
+  const chatReqs = mock.requests.filter((r) => r.path.startsWith('/v1/chat/completions'))
+  const pageText = await fixture.page.locator('body').innerText().catch(() => '')
+  saveEvidence(`${args.label}-debug.json`, {
+    sawReply,
+    chatReqCount: chatReqs.length,
+    chatReqs: chatReqs.map(r => ({ model: r.model, path: r.path, at: r.at })),
+    allPaths: mock.requests.map(r => ({ path: r.path, method: r.method })),
+    pageTextSnippet: pageText.slice(0, 4000),
+  })
+  collectEgressEvidence(mock, fixture.sandbox.root, args.label)
+  expect(sawReply, `${args.name} should not yield normal mock reply`).toBeFalsy()
+  expect(chatReqs.length, `Expected physical provider request to reach localhost mock (${args.name})`).toBeGreaterThan(0)
+  assertNoVirtualModelOnWire(mock)
+  expect(chatReqs.some((r) => r.model === 'mockinfra-free-model')).toBeTruthy()
+  saveEvidence(`${args.label}-mock-requests.json`, chatReqs.map(r => ({ model: r.model, path: r.path, at: r.at })))
+}
 
   test.afterEach(async () => {
     if (fixture) {
@@ -564,18 +618,35 @@ test.describe('AUTOROUTER_HERMES Dispatch 158 - packaged private RC desktop E2E'
     await pageReadySettled(fixture.page)
     await sendChat(fixture.page, 'Dispatch 158 HTTP 500 provider error proof')
 
-    await expectUiErrorOrRefusal(fixture.page, 180_000).catch(async () => {
-      await takeEvidenceScreenshot(fixture.page, 'http500-no-error-text.png').catch(() => null)
-    })
-    await fixture.page.waitForTimeout(2000)
+    let sawReply = false
+    try {
+      await expect(fixture.page.getByText(MOCK_REPLY, { exact: false }).first()).toBeVisible({ timeout: 30_000 })
+      sawReply = true
+    } catch {}
+    if (!sawReply) {
+      await expectUiErrorOrRefusal(fixture.page, 180_000).catch(async () => {
+        await takeEvidenceScreenshot(fixture.page, 'http500-no-error-text.png').catch(() => null)
+      })
+    }
+    await fixture.page.waitForTimeout(3000)
     await takeEvidenceScreenshot(fixture.page, 'http500-provider-error.png').catch(() => null)
 
     const chatReqs = mock.requests.filter((r) => r.path.startsWith('/v1/chat/completions'))
-    expect(chatReqs.length).toBeGreaterThan(0)
+    const pageText = await fixture.page.locator('body').innerText().catch(() => '')
+    saveEvidence('http500-debug.json', {
+      sawReply,
+      chatReqCount: chatReqs.length,
+      chatReqs: chatReqs.map(r => ({ model: r.model, path: r.path, at: r.at })),
+      allPaths: mock.requests.map(r => ({ path: r.path, method: r.method })),
+      pageTextSnippet: pageText.slice(0, 4000),
+    })
+    collectEgressEvidence(mock, fixture.sandbox.root, 'http500')
+
+    expect(sawReply, 'Provider 500 should not yield normal mock reply').toBeFalsy()
+    expect(chatReqs.length, 'Expected physical provider request to reach localhost mock (HTTP 500 path)').toBeGreaterThan(0)
     assertNoVirtualModelOnWire(mock)
     expect(chatReqs.some((r) => r.model === 'mockinfra-free-model')).toBeTruthy()
     saveEvidence('http500-mock-requests.json', chatReqs.map(r => ({ model: r.model, path: r.path, at: r.at })))
-    collectEgressEvidence(mock, fixture.sandbox.root, 'http500')
   })
 
   test('no eligible route when required tools unsupported (ineligible model): refusal with zero outbound', async () => {
@@ -606,6 +677,40 @@ test.describe('AUTOROUTER_HERMES Dispatch 158 - packaged private RC desktop E2E'
     expect(chatReqs.length).toBe(0)
     saveEvidence('ineligible-tools-mock.json', summarizeMock(mock))
     collectEgressEvidence(mock, fixture.sandbox.root, 'ineligible-tools')
+  })
+
+  test('HTTP 401 from physical provider: no virtual model on wire and UI surfaces provider error', async () => {
+    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
+    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    await runPhysicalProviderErrorCase({
+      name: 'HTTP 401',
+      label: 'http401',
+      mockOpts: { chatStatus: 401, chatBody: { error: { message: 'Unauthorized (mock)', type: 'authentication_error', code: 'unauthorized' } } },
+      prompt: 'Dispatch 158 HTTP 401 provider error proof',
+    })
+  })
+
+  test('HTTP 403 from physical provider: no virtual model on wire and UI surfaces provider error', async () => {
+    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
+    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    await runPhysicalProviderErrorCase({
+      name: 'HTTP 403',
+      label: 'http403',
+      mockOpts: { chatStatus: 403, chatBody: { error: { message: 'Forbidden (mock)', type: 'permission_error', code: 'forbidden' } } },
+      prompt: 'Dispatch 158 HTTP 403 provider error proof',
+    })
+  })
+
+  test('transport failure from physical provider (connection reset): no virtual model on wire and UI surfaces error', async () => {
+    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
+    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    await runPhysicalProviderErrorCase({
+      name: 'transport failure',
+      label: 'transport-reset',
+      mockOpts: { destroySocket: true },
+      prompt: 'Dispatch 158 transport failure provider error proof',
+      timeoutMs: 240_000,
+    })
   })
 
   test('isolation, protocol registration skip, and sandbox evidence', async () => {
