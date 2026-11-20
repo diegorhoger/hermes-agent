@@ -78,7 +78,10 @@ test('a missing Linux HUD toolchain leaves no empty package directories', () => 
     // On a native Linux host this takes the compiler-failure path; the
     // "modifier tap unavailable for this target" message is only for
     // cross-target packaging. Both paths must fail soft without a staged dir.
-    assert.match(warnings.join('\n'), /\[hud-modifier\] unavailable: native build needs/)
+    assert.match(
+      warnings.join('\n'),
+      /\[hud-modifier\].*(?:unavailable: native build needs|needs a native build; modifier tap unavailable for this target)/
+    )
   } finally {
     console.warn = originalWarn
     fs.rmSync(tmp, { recursive: true, force: true })

@@ -30,6 +30,14 @@ class _InferencePeer(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def _send_json(self, status, payload, content_type="application/json"):
+        raw = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def _record(self, body):
         self.server.requests.append({
             "model": body.get("model"),
@@ -40,18 +48,20 @@ class _InferencePeer(BaseHTTPRequestHandler):
         })
 
     def do_GET(self):
-        raw = json.dumps({"data": [{"id": m, "object": "model"}
-                                   for m in (MODEL_A, MODEL_B, "model-switched")]}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        self._send_json(200, {"data": [{"id": m, "object": "model"}
+                                       for m in (MODEL_A, MODEL_B, "model-switched")]})
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self._record(body)
         server = self.server
+        # Only the turn's chat completion participates in the overlap barrier.
+        # Endpoint metadata probes (/api/show, /v1/models) and auxiliary calls
+        # are not the two concurrent first-round inference requests under test.
+        is_turn_inference = self.path.startswith("/v1/chat/completions")
+        if not is_turn_inference:
+            self._send_json(200, {"ok": True})
+            return
         # Both DIFFERENT endpoints must receive their FIRST request before
         # either can respond. Separate per-endpoint gates would deadlock until
         # retries arrived and could misleadingly mark the overlap test green.
@@ -66,17 +76,29 @@ class _InferencePeer(BaseHTTPRequestHandler):
                 return
         if getattr(server, "fail_next", False):
             server.fail_next = False
-            raw = json.dumps({"error": {"message": "synthetic failure", "type": "server_error"}}).encode()
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
+            self._send_json(500, {"error": {"message": "synthetic failure", "type": "server_error"}})
             return
         reply = "LOCAL_ACK_" + str(body.get("model"))
+        model = body.get("model")
+        if body.get("stream"):
+            # A real streaming client requires a valid SSE completion; answering
+            # a stream request with a single JSON object causes an empty-stream
+            # error and retries, which would make "one request per endpoint"
+            # fail for fixture reasons rather than routing reasons.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            base = {"id": "chatcmpl-shared", "object": "chat.completion.chunk", "created": 1, "model": model}
+            for delta, finish in (({"role": "assistant", "content": reply}, None), ({}, "stop")):
+                chunk = {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
         raw = json.dumps({
             "id": "chatcmpl-shared", "object": "chat.completion", "created": 1,
-            "model": body.get("model"),
+            "model": model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": reply},
                          "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
@@ -130,6 +152,10 @@ def configured_home(monkeypatch, peers):
         "providers": {
             "account_b": {"name": "account_b", "base_url": url_b, "api_key": KEY_B},
         },
+        # Auxiliary title generation would issue a second chat completion on the
+        # same endpoint with the turn's prompt; the overlap gate must count only
+        # the two real turn requests.
+        "auxiliary": {"title_generation": {"enabled": False}},
     }), encoding="utf-8")
     return home
 
