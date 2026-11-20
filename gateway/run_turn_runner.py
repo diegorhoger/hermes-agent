@@ -1478,6 +1478,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 request_json=getattr(policy, "request_json", "") if policy is not None else None,
                 session_model_override=_session_override,
                 one_turn_override=_one_turn_override,
+                api_settings=api.get("settings") if isinstance(api, dict) else None,
             )
             # Runtime/session-explicit picks must never be rewritten by ordinary-session pre-inference
             # routing. Explicitly selected session policy models/providers are authoritative; ordinary
