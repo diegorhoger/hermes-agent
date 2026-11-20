@@ -270,13 +270,41 @@ async function selectModelByVisibleText(page: Page, text: string): Promise<void>
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
   const wanted = norm(text)
   const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const tryClick = async (loc: any): Promise<boolean> => {
+
+  const search = () => page.locator('input[placeholder*="Search" i], input[type="search"], [cmdk-input], [role="combobox"]').first()
+
+  const tryKeyboardSelect = async (): Promise<boolean> => {
+    const s = search()
+    if (!((await s.count().catch(() => 0)) > 0 && (await s.isVisible().catch(() => false)))) return false
     try {
-      if (!(await loc.isVisible().catch(() => false))) return false
-      // Avoid toggling favorite/star controls inside model rows.
-      await loc.click({ timeout: 15_000 })
-      await page.waitForTimeout(700)
-      // Dismiss picker/menu if still covering composer.
+      await s.click({ timeout: 5_000 }).catch(() => undefined)
+      await s.fill('').catch(() => undefined)
+      await page.waitForTimeout(150)
+      await s.fill(text).catch(() => undefined)
+      await page.waitForTimeout(900)
+      // cmdk usually highlights first result; ensure focus in list/input and select
+      await page.keyboard.press('ArrowDown').catch(() => undefined)
+      await page.waitForTimeout(150)
+      await page.keyboard.press('Enter').catch(() => undefined)
+      await page.waitForTimeout(900)
+      await page.keyboard.press('Escape').catch(() => undefined)
+      await page.waitForTimeout(300)
+      // Heuristic: picker likely closed; assume success and let caller/test verify effect via behavior/evidence.
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const tryClickItem = async (): Promise<boolean> => {
+    const item = page.locator('[cmdk-item], [role="option"], [role="menuitem"]').filter({ hasText: new RegExp(escaped, 'i') }).first()
+    try {
+      if (!(await item.isVisible().catch(() => false))) return false
+      const itemText = norm(await item.innerText().catch(async () => (await item.textContent().catch(() => '')) || ''))
+      if (itemText && !itemText.includes(wanted) && !wanted.includes(itemText)) return false
+      await item.scrollIntoViewIfNeeded().catch(() => undefined)
+      await item.click({ timeout: 10_000 })
+      await page.waitForTimeout(900)
       await page.keyboard.press('Escape').catch(() => undefined)
       await page.waitForTimeout(300)
       return true
@@ -284,45 +312,21 @@ async function selectModelByVisibleText(page: Page, text: string): Promise<void>
       return false
     }
   }
+
   for (let attempt = 0; attempt < 10; attempt++) {
-    const search = page.locator('input[placeholder*="Search" i], input[type="search"], [cmdk-input], [role="combobox"]').first()
-    if ((await search.count().catch(() => 0)) > 0 && (await search.isVisible().catch(() => false))) {
-      await search.fill(text).catch(() => undefined)
+    if (await tryKeyboardSelect()) return
+    const s = search()
+    if ((await s.count().catch(() => 0)) > 0 && (await s.isVisible().catch(() => false))) {
+      await s.fill('').catch(() => undefined)
+      await page.waitForTimeout(150)
+      await s.fill(text).catch(() => undefined)
+      await page.waitForTimeout(900)
+    }
+    if (await tryClickItem()) return
+    if ((await s.count().catch(() => 0)) > 0 && (await s.isVisible().catch(() => false))) {
+      await s.fill(text.split(/[-_]/).slice(0, 2).join('-')).catch(() => undefined)
       await page.waitForTimeout(700)
-    }
-    const direct = [
-      page.locator('[role="menuitem"], [role="option"], [cmdk-item]').filter({ hasText: new RegExp(escaped, 'i') }).first(),
-      page.getByRole('menuitem', { name: new RegExp(escaped, 'i') }).first(),
-      page.getByRole('option', { name: new RegExp(escaped, 'i') }).first(),
-      page.getByText(text, { exact: false }).first(),
-    ]
-    for (const item of direct) {
-      if (await tryClick(item)) return
-    }
-    const rows = page.locator('[role="menuitem"], [role="option"], [cmdk-item]')
-    const n = await rows.count().catch(() => 0)
-    for (let i = 0; i < n; i++) {
-      const row = rows.nth(i)
-      try {
-        if (!(await row.isVisible().catch(() => false))) continue
-        const rowText = norm(await row.innerText().catch(() => ''))
-        if (!rowText || !(rowText.includes(wanted) || wanted.includes(rowText))) continue
-        // Click model label area if present to avoid favorite buttons.
-        const label = row.locator('mark, [data-slot*="label"], [class*="label"], span').filter({ hasText: /baseline|mockinfra/i }).first()
-        if ((await label.count().catch(() => 0)) > 0 && await tryClick(label)) return
-        // Fallback: click left side of row.
-        try {
-          const box = await row.boundingBox()
-          if (box) {
-            await page.mouse.click(box.x + Math.min(80, box.width / 3), box.y + box.height / 2)
-            await page.waitForTimeout(700)
-            await page.keyboard.press('Escape').catch(() => undefined)
-            await page.waitForTimeout(300)
-            return
-          }
-        } catch {}
-        if (await tryClick(row)) return
-      } catch {}
+      if (await tryClickItem()) return
     }
     await page.waitForTimeout(400)
   }
@@ -691,17 +695,24 @@ async function runPhysicalProviderErrorCase(args: {
     })
     await waitForComposerReady(fixture, 240_000)
     await pageReadySettled(fixture.page)
-    // Explicitly choose the baseline physical model in the UI so ordinary-session native routing must not rewrite it.
-    await selectModelByVisibleText(fixture.page, 'mockinfra-baseline-model')
+    // Explicitly choose a physical model in the UI; ordinary-session native routing must not rewrite an explicit selection.
+    // Use a model different from the routed free model to make wire authority unambiguous.
+    const explicitModel = 'mockinfra-unknown-cost-model'
+    await selectModelByVisibleText(fixture.page, explicitModel)
+    await fixture.page.waitForTimeout(1500)
     await sendChatAndExpectReply(fixture.page, 'Dispatch 159 explicit physical model override proof', 240_000)
     const chatReqs = mock.requests.filter((r) => r.path.startsWith('/v1/chat/completions'))
-    expect(chatReqs.length).toBeGreaterThan(0)
-    assertNoVirtualModelOnWire(mock)
-    expect(chatReqs.every((r) => r.model === 'mockinfra-baseline-model')).toBeTruthy()
     saveEvidence('explicit-override-mock-requests.json', chatReqs.map(r => ({ model: r.model, path: r.path, at: r.at })))
     saveEvidence('explicit-override-native-routing-state.json', readJsonIfExists(path.join(fixture.sandbox.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json')) || {})
     collectAutorouterPluginArtifacts(fixture.sandbox.root, 'explicit-override')
     collectEgressEvidence(mock, fixture.sandbox.root, 'explicit-override')
+    try {
+      const cfg = path.join(fixture.sandbox.hermesHome, 'config.yaml')
+      if (fs.existsSync(cfg)) saveEvidence('explicit-override-config.yaml', fs.readFileSync(cfg, 'utf8'))
+    } catch {}
+    expect(chatReqs.length).toBeGreaterThan(0)
+    assertNoVirtualModelOnWire(mock)
+    expect(chatReqs.every((r) => r.model === explicitModel)).toBeTruthy()
   })
 
   test('disable native routing returns normal behavior (no autorouter interception)', async () => {
