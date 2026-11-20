@@ -299,17 +299,22 @@ function summarizeMock(mock: SimpleMock) {
 
 function collectEgressEvidence(mock: SimpleMock, sandboxRoot: string, label: string) {
   const summary = summarizeMock(mock)
-  const allLocal = mock.requests.every(() => true) // server only bound to 127.0.0.1
-  const hosts = ['127.0.0.1']
+  // This server can prove what it received, not that the process made no
+  // additional requests to other hosts. Never turn receipt collection into a
+  // blanket egress-allowance assertion.
+  const bound = new URL(mock.url)
+  const mockBoundToLoopback = bound.protocol === 'http:' && bound.hostname === '127.0.0.1'
+  if (!mockBoundToLoopback) throw new Error('Mock provider is not bound to loopback')
   const evidence = {
     label,
-    mockBoundHost: '127.0.0.1',
+    mockBoundHost: bound.hostname,
     mockUrl: mock.url,
-    hostsObserved: hosts,
-    allAcceptedByLocalMock: allLocal,
+    hostsObservedByMock: [bound.hostname],
+    observedMockRequestsAreLoopback: mockBoundToLoopback,
+    nonLoopbackEgressExcluded: false,
     requestSummary: summary,
-    syntheticKeysOnly: true,
-    limitation: 'Egress evidence is based on the localhost-only mock server receiving all chat completions and fixture configuration using synthetic keys/loopback base URLs; OS-level packet capture was not added in this harness. No non-local mock endpoint was configured or contacted by recorded requests.',
+    syntheticKeysConfiguredByFixture: true,
+    limitation: 'Only requests received by this 127.0.0.1 mock were observed. This does not prove other network egress was absent; no packet-level egress monitor or network-deny boundary was used.',
   }
   saveEvidence(`${label}-egress.json`, evidence)
   appendJsonlEvidence('egress-all.jsonl', evidence)
