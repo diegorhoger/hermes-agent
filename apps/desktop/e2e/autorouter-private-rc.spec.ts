@@ -1245,6 +1245,7 @@ async function runPhysicalProviderErrorCase(args: {
     saveEvidence('accessibility-state.json', {
       accessibleOptionNameFound: true,
       accessibleItemRole,
+      searchFocusTag: focusBefore.tag,
       searchFocusRole: focusBefore.role,
       searchAriaSelected: focusBefore.ariaSelected,
       focusStayedInDialog: focusBefore.inDialog,
