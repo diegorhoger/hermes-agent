@@ -261,6 +261,27 @@ async function assertAutoRouterNotActionableInPicker(page: Page): Promise<void> 
   await page.keyboard.press('Escape').catch(() => undefined)
 }
 
+async function selectModelByVisibleText(page: Page, text: string): Promise<void> {
+  await openModelPickerUi(page)
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const item = page.getByText(text, { exact: false }).first()
+    if (await item.isVisible().catch(() => false)) {
+      await item.click({ timeout: 15_000 })
+      await page.waitForTimeout(700)
+      return
+    }
+    const search = page.locator('input[placeholder*="Search" i], input[type="search"], [cmdk-input], [role="combobox"]').first()
+    if ((await search.count().catch(() => 0)) > 0 && (await search.isVisible().catch(() => false))) {
+      await search.fill(text)
+      await page.waitForTimeout(900)
+      continue
+    }
+    await page.waitForTimeout(500)
+  }
+  await expect(page.getByText(text, { exact: false }).first()).toBeVisible({ timeout: 30_000 })
+  await page.getByText(text, { exact: false }).first().click({ timeout: 15_000 })
+}
+
 async function sendChat(page: Page, text: string): Promise<void> {
   const { waitForChatReady } = await import('../../../tests-js/scripts/desktop-chat-smoke')
   const composer = await waitForChatReady(page, 120_000)
@@ -600,6 +621,39 @@ async function runPhysicalProviderErrorCase(args: {
         pluginDataFiles: Object.keys(onArtifacts.files || {}),
       },
     })
+  })
+
+  test('Mode B explicit physical-model selection remains authoritative on wire', async () => {
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
+    mock = await startSimpleMock()
+    fixture = await setupPackagedAppRealBackend({
+      appPattern: APP_PATTERN,
+      sandboxPrefix: 'autorouter-explicit-override',
+      prepareSandbox: (sandbox) => {
+        // Native routing enabled with baseline default, but user explicitly selects a physical model in UI.
+        prepareHome(sandbox.hermesHome, mock!.url, {
+          chatRouter: false,
+          nativeRouting: true,
+          defaultProvider: 'mockinfra',
+          defaultModel: 'mockinfra-baseline-model',
+        })
+      },
+      env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic' },
+    })
+    await waitForComposerReady(fixture, 240_000)
+    await pageReadySettled(fixture.page)
+    // Explicitly choose the baseline physical model in the UI so ordinary-session native routing must not rewrite it.
+    await selectModelByVisibleText(fixture.page, 'mockinfra-baseline-model')
+    await sendChatAndExpectReply(fixture.page, 'Dispatch 159 explicit physical model override proof', 240_000)
+    const chatReqs = mock.requests.filter((r) => r.path.startsWith('/v1/chat/completions'))
+    expect(chatReqs.length).toBeGreaterThan(0)
+    assertNoVirtualModelOnWire(mock)
+    expect(chatReqs.every((r) => r.model === 'mockinfra-baseline-model')).toBeTruthy()
+    saveEvidence('explicit-override-mock-requests.json', chatReqs.map(r => ({ model: r.model, path: r.path, at: r.at })))
+    saveEvidence('explicit-override-native-routing-state.json', readJsonIfExists(path.join(fixture.sandbox.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json')) || {})
+    collectAutorouterPluginArtifacts(fixture.sandbox.root, 'explicit-override')
+    collectEgressEvidence(mock, fixture.sandbox.root, 'explicit-override')
   })
 
   test('disable native routing returns normal behavior (no autorouter interception)', async () => {
