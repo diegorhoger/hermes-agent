@@ -1052,6 +1052,9 @@ async function runPhysicalProviderErrorCase(args: {
       // Continue in resumed/new context and verify routing remains physical and correct (no virtual wire).
       const prompt2 = 'Dispatch 159 restart-resume second routed turn'
       await sendChatAndExpectReply(page2, prompt2, 240_000)
+      // An old transcript reply can satisfy a plain "reply visible" wait; require
+      // an actual new wire request before asserting the resumed turn's route.
+      await waitForChatRequestCount(reqsAfterFirst.length)
       await page2.waitForTimeout(1500)
       const reqsAfterSecond = mock.requests.filter((r) => r.path.startsWith('/v1/chat/completions'))
       expect(reqsAfterSecond.length).toBeGreaterThan(reqsAfterFirst.length)
@@ -1102,6 +1105,15 @@ async function runPhysicalProviderErrorCase(args: {
     if ((await pill.count().catch(() => 0)) > 0) return (await pill.innerText().catch(() => '')) || ''
     const btn = page.getByRole('button', { name: /model|auto|mockinfra/i }).first()
     return (await btn.innerText().catch(() => '')) || ''
+  }
+
+  async function waitForChatRequestCount(threshold: number, timeoutMs = 90_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (mock && mock.requests.filter((r) => r.path.startsWith('/v1/chat/completions')).length > threshold) return
+      await new Promise((r) => setTimeout(r, 500))
+    }
+    throw new Error(`Timed out waiting for a new chat request beyond ${threshold}; observed ${mock?.requests.filter((r) => r.path.startsWith('/v1/chat/completions')).length ?? 0}`)
   }
 
   function chatWire(): Array<{ model: string; auth?: string; prompt?: string; at: number }> {
