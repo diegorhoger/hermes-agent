@@ -1490,7 +1490,13 @@ async function runPhysicalProviderErrorCase(args: {
       ariaSelected: (el as HTMLElement).getAttribute('aria-selected'),
       dataState: (el as HTMLElement).getAttribute('data-state'),
       ariaChecked: (el as HTMLElement).getAttribute('aria-checked'),
+      ariaCurrent: (el as HTMLElement).getAttribute('aria-current'),
     }))
+    // The current model row is a submenu trigger (role="menuitem"), so
+    // aria-checked/aria-selected would be invalid there. aria-current is the
+    // valid global state for "current item in this set" and must be exposed.
+    expect(selectedSemantics.ariaCurrent,
+      'the selected AutoRouter row must expose aria-current for assistive technology').toBe('true')
     saveEvidence('narrow-viewport-selected-state.json', selectedSemantics)
     await fixture.page.keyboard.press('Escape').catch(() => undefined)
     await fixture.page.waitForTimeout(300)
@@ -1500,15 +1506,38 @@ async function runPhysicalProviderErrorCase(args: {
     assertNoVirtualModelOnWire(mock!)
     expect(wire.at(-1)?.model).toBe('mockinfra-free-model')
 
+    // The narrow layout must not scroll horizontally; this is an assertion,
+    // not merely recorded evidence.
     const overflow = await fixture.page.evaluate(() => ({
       innerWidth: window.innerWidth,
       scrollWidth: document.documentElement.scrollWidth,
     }))
+    expect(overflow.scrollWidth,
+      `narrow viewport must not overflow horizontally: ${JSON.stringify(overflow)}`).toBeLessThanOrEqual(overflow.innerWidth + 1)
+
+    // The selection persists across a second turn and can be switched back to
+    // a physical model with the keyboard, without losing route authority.
+    const beforeSwitchCount = chatWire().length
+    await sendChatAndExpectReply(fixture.page, 'narrow-viewport autorouter persists')
+    const persisted = chatWire().slice(beforeSwitchCount)
+    expect(persisted.length).toBeGreaterThan(0)
+    expect(persisted.every((r) => r.model === 'mockinfra-free-model')).toBe(true)
+
+    await selectModelByVisibleText(fixture.page, 'mockinfra-unknown-cost-model')
+    const afterSwitchCount = chatWire().length
+    await sendChatAndExpectReply(fixture.page, 'narrow-viewport back to physical')
+    const switched = chatWire().slice(afterSwitchCount)
+    expect(switched.length).toBeGreaterThan(0)
+    expect(switched.every((r) => r.model === 'mockinfra-unknown-cost-model')).toBe(true)
+    assertNoVirtualModelOnWire(mock!)
+
     saveEvidence('narrow-viewport-accessibility.json', {
       viewport: { width: 390, height: 844 },
       accessibleRole: menuItemVisible ? 'menuitem' : 'option',
       selectedSemantics,
       wireModels: wire.map((r) => r.model),
+      persistedWireModels: persisted.map((r) => r.model),
+      switchedBackWireModels: switched.map((r) => r.model),
       overflow,
       note: 'Narrow-viewport picker keeps the accessible AutoRouter option/menuitem and keyboard selection; the resolved physical model reached the localhost mock and no virtual identifier was sent.',
     })

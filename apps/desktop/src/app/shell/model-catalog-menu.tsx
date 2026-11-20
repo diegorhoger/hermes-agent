@@ -1144,6 +1144,7 @@ function ModelFamilyRow({
   return (
     <DropdownMenuSub onOpenChange={open => onSubOpenChange?.(open, rowKey)}>
       <DropdownMenuSubTrigger
+        aria-current={isCurrent ? 'true' : undefined}
         onClick={event => {
           // Shift-click stars, the same gesture that pins a chat row in the
           // sidebar. Nothing is picked and the menu stays open, so a second
