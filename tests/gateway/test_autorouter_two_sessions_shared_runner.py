@@ -52,13 +52,18 @@ class _InferencePeer(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self._record(body)
         server = self.server
-        # Force overlap: every inference request waits until both sessions have
-        # reached their endpoint before either is answered.
+        # Both DIFFERENT endpoints must receive their FIRST request before
+        # either can respond. Separate per-endpoint gates would deadlock until
+        # retries arrived and could misleadingly mark the overlap test green.
         with server.arrival_lock:
             server.arrived += 1
-            if server.arrived >= 2:
-                server.release.set()
-        assert server.release.wait(20), "overlapping inference gate timed out"
+            first_in_phase = server.arrived == 1
+        if first_in_phase:
+            try:
+                server.shared_barrier.wait(timeout=15)
+            except threading.BrokenBarrierError:
+                self.send_error(503, "two-session overlap barrier not reached")
+                return
         if getattr(server, "fail_next", False):
             server.fail_next = False
             raw = json.dumps({"error": {"message": "synthetic failure", "type": "server_error"}}).encode()
@@ -86,12 +91,13 @@ class _InferencePeer(BaseHTTPRequestHandler):
 @pytest.fixture
 def peers():
     servers = []
+    shared_barrier = threading.Barrier(2)
     for _ in range(2):
         server = ThreadingHTTPServer(("127.0.0.1", 0), _InferencePeer)
         server.requests = []
         server.arrived = 0
         server.arrival_lock = threading.Lock()
-        server.release = threading.Event()
+        server.shared_barrier = shared_barrier
         server.fail_next = False
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)
@@ -229,7 +235,11 @@ async def test_two_sessions_overlap_on_one_runner_with_isolated_routes(configure
             _wait_terminal(authority, sid_a, "overlap-A"),
             _wait_terminal(authority, sid_b, "overlap-B"),
         )
-        assert s_a.arrived >= 1 and s_b.arrived >= 1
+        assert s_a.arrived == 1 and s_b.arrived == 1, (
+            "Both endpoints must receive exactly one first-round inference request; "
+            "retries cannot be evidence of the intended overlap",
+            s_a.arrived, s_b.arrived,
+        )
 
         wa = [r for r in s_a.requests if r["path"].startswith("/v1/chat/completions")]
         wb = [r for r in s_b.requests if r["path"].startswith("/v1/chat/completions")]
@@ -239,7 +249,6 @@ async def test_two_sessions_overlap_on_one_runner_with_isolated_routes(configure
         assert wb[0]["auth"] == f"Bearer {KEY_B}"
         assert "OVERLAP_TURN_A" in wa[0]["prompt"]
         assert "OVERLAP_TURN_B" in wb[0]["prompt"]
-        assert url_a in wa[0]["path"] or wa[0]["path"].startswith("/v1")
         _assert_no_virtual(wa + wb)
         # No endpoint/credential crossed: each mock saw only its own model+key.
         assert all(r["model"] == MODEL_A and r["auth"] == f"Bearer {KEY_A}" for r in wa)
@@ -263,7 +272,7 @@ async def test_session_a_switch_and_failure_cannot_redirect_session_b(configured
                                expected_revision=row_a["runtime_revision"],
                                expected_generation=row_a["runtime_generation"])
         assert switched["operation"] == "model", switched
-        s_a.release.clear(); s_a.arrived = 0; s_b.release.clear(); s_b.arrived = 0
+        s_a.arrived = 0; s_b.arrived = 0
         await asyncio.gather(
             a.rpc("prompt.submit", input_id="after-switch-A", text="AFTER_SWITCH_A"),
             b.rpc("prompt.submit", input_id="after-switch-B", text="AFTER_SWITCH_B"),
@@ -278,7 +287,7 @@ async def test_session_a_switch_and_failure_cannot_redirect_session_b(configured
 
         # Session A's provider fails; B's next turn must be unaffected.
         s_a.fail_next = True
-        s_a.release.clear(); s_a.arrived = 0; s_b.release.clear(); s_b.arrived = 0
+        s_a.arrived = 0; s_b.arrived = 0
         await asyncio.gather(
             a.rpc("prompt.submit", input_id="fail-A", text="FAIL_TURN_A"),
             b.rpc("prompt.submit", input_id="ok-B", text="OK_TURN_B"),
