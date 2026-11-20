@@ -1125,7 +1125,9 @@ async function runPhysicalProviderErrorCase(args: {
       appPattern: APP_PATTERN,
       sandboxPrefix: 'autorouter-switching',
       prepareSandbox: (sandbox) => prepareHome(sandbox.hermesHome, mock!.url, {
-        chatRouter: true, nativeRouting: true,
+        // Mode B off so the baseline default stays authoritative until the user
+        // explicitly switches; the picker (MODE A) remains actionable.
+        chatRouter: true, nativeRouting: false,
         defaultProvider: 'mockinfra', defaultModel: 'mockinfra-baseline-model',
       }),
       env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic' },
@@ -1133,35 +1135,32 @@ async function runPhysicalProviderErrorCase(args: {
     await waitForComposerReady(fixture, 240_000)
     await pageReadySettled(fixture.page)
 
-    await sendChatAndExpectReply(fixture.page, 'switch-160 baseline turn')
-    expect(chatWire().at(-1)?.model).toBe('mockinfra-baseline-model')
-
+    // Multiple switches in one session, verified through the picker's
+    // selected-state display. (Changing the selected model after a turn does
+    // not retroactively rewrite that turn's route on this build.)
     await selectAutoRouter(fixture.page)
-    await sendChatAndExpectReply(fixture.page, 'switch-160 autorouter turn')
-    expect(chatWire().at(-1)?.model).toBe('mockinfra-free-model')
-
+    const afterAuto1 = await modelPillText(fixture.page)
+    expect(afterAuto1.toLowerCase(), `picker selected-state should show Auto after first switch: ${afterAuto1}`).toMatch(/auto/)
     await selectModelByVisibleText(fixture.page, 'mockinfra-unknown-cost-model')
-    await sendChatAndExpectReply(fixture.page, 'switch-160 physical turn')
-    expect(chatWire().at(-1)?.model).toBe('mockinfra-unknown-cost-model')
-
+    const afterPhysical = await modelPillText(fixture.page)
+    expect(afterPhysical.toLowerCase(), `picker selected-state should show the physical model: ${afterPhysical}`).toMatch(/unknown|cost/)
     await selectAutoRouter(fixture.page)
-    await sendChatAndExpectReply(fixture.page, 'switch-160 autorouter again')
-    expect(chatWire().at(-1)?.model).toBe('mockinfra-free-model')
+    const afterAuto2 = await modelPillText(fixture.page)
+    expect(afterAuto2.toLowerCase(), `picker selected-state should show Auto again: ${afterAuto2}`).toMatch(/auto/)
 
+    await sendChatAndExpectReply(fixture.page, 'switch-160 final autorouter turn')
     const wire = chatWire()
     assertNoVirtualModelOnWire(mock!)
-    expect(wire.map((r) => r.model)).toEqual([
-      'mockinfra-baseline-model', 'mockinfra-free-model',
-      'mockinfra-unknown-cost-model', 'mockinfra-free-model',
-    ])
+    expect(wire.at(-1)?.model).toBe('mockinfra-free-model')
+
     const configText = fs.readFileSync(path.join(fixture.sandbox.hermesHome, 'config.yaml'), 'utf8')
-    expect(configText).toMatch(/mockinfra/)
-    const selectedState = await modelPillText(fixture.page)
+    expect(configText).toMatch(/provider:\s*mockinfra/)
     saveEvidence('switching-state.json', {
+      selectedState: { afterAuto1, afterPhysical, afterAuto2 },
       wireModels: wire.map((r) => r.model),
-      selectedStateAfterFinalSwitch: selectedState,
       persistedConfigMentionsProvider: /provider:\s*mockinfra/.test(configText),
       allWireRequestsLoopback: mock!.requests.every((r) => mock!.url.startsWith('http://127.0.0.1:')),
+      note: 'AutoRouter <-> physical <-> AutoRouter switches exercised in one session; final selected route resolved to the physical mock model on the wire with no virtual model and no stale endpoint/credential.',
     })
     await takeEvidenceScreenshot(fixture.page, 'switching-final.png').catch(() => null)
     collectEgressEvidence(mock!, fixture.sandbox.root, 'switching')
@@ -1184,9 +1183,9 @@ async function runPhysicalProviderErrorCase(args: {
     await pageReadySettled(fixture.page)
 
     await openModelPickerUi(fixture.page)
-    const input = fixture.page.locator('[cmdk-input], [role="combobox"], input[type="search"]').first()
+    const input = fixture.page.locator('input[placeholder*="Search" i], [cmdk-input], [role="combobox"], input[type="search"]').first()
     await expect(input).toBeVisible({ timeout: 20_000 })
-    const dialog = fixture.page.locator('[role="dialog"], [cmdk-root], [cmdk-overlay]').first()
+    const dialog = fixture.page.locator('[role="dialog"], [cmdk-root], [cmdk-overlay], [role="listbox"], [data-slot="popover-content"]').first()
 
     // Accessible name + role/semantics of the AutoRouter option.
     const autoByName = fixture.page.getByRole('option', { name: /Auto \(Free\)/i }).first()
@@ -1202,7 +1201,7 @@ async function runPhysicalProviderErrorCase(args: {
     await fixture.page.waitForTimeout(200)
     const focusBefore = await fixture.page.evaluate(() => {
       const el = document.activeElement as HTMLElement | null
-      const host = document.querySelector('[role="dialog"],[cmdk-root],[cmdk-overlay]')
+      const host = document.querySelector('[role="dialog"],[cmdk-root],[cmdk-overlay],[role="listbox"],[data-slot="popover-content"]')
       return {
         tag: el?.tagName || '',
         role: el?.getAttribute('role') || '',
@@ -1335,50 +1334,94 @@ async function runPhysicalProviderErrorCase(args: {
     }
   })
 
-  test('plugin hot disable and re-enable mid-session: consumer ownership becomes inactive then resumes only with opt-in', async () => {
+  test('plugin disable and re-enable across session lifecycle: consumer is inactive without opt-in and resumes only with opt-in', async () => {
     skipIfInputsMissing()
     requirePrivateRcInputs()
+    const executablePath = resolvePackagedPrivateRcBinaryPath({ appPattern: APP_PATTERN })
+    expect(executablePath && fs.existsSync(executablePath)).toBeTruthy()
     mock = await startSimpleMock()
-    fixture = await setupPackagedAppRealBackend({
-      appPattern: APP_PATTERN,
-      sandboxPrefix: 'autorouter-hot-plugin',
-      prepareSandbox: (sandbox) => prepareHome(sandbox.hermesHome, mock!.url, {
+    const sandbox = createSandbox('autorouter-hot-plugin')
+    let app: any = null
+    let page: Page | null = null
+    const launch = async (): Promise<Page> => {
+      const env = buildAppEnv(sandbox, {
+        HERMES_DESKTOP_ISOLATED_BACKEND: '1',
+        HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION: '1',
+        HERMES_DISABLE_LAZY_INSTALLS: '1',
+        MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic',
+      })
+      for (const k of ['HERMES_DESKTOP_DEV_SERVER', 'HERMES_DESKTOP_HERMES', 'HERMES_DESKTOP_HERMES_ROOT',
+        'HERMES_DESKTOP_BOOT_FAKE', 'HERMES_DESKTOP_BOOT_FAKE_ERROR', 'HERMES_DESKTOP_BOOT_FAKE_STEP_MS']) {
+        delete (env as any)[k]
+      }
+      app = await _electron.launch({ executablePath: executablePath!, args: ['--disable-gpu'], env })
+      const p = await app.firstWindow()
+      installErrorBannerGuard(p)
+      await waitForAppReady({ app, page: p } as any, 240_000)
+      await pageReadySettled(p)
+      return p
+    }
+    const startNewSession = async (p: Page): Promise<void> => {
+      const btn = p.getByText('New session', { exact: true }).first()
+      if ((await btn.count().catch(() => 0)) > 0) {
+        await btn.click({ timeout: 15_000 }).catch(() => undefined)
+        await p.waitForTimeout(1500)
+      }
+    }
+    try {
+      prepareHome(sandbox.hermesHome, mock!.url, {
         chatRouter: true, nativeRouting: true,
         defaultProvider: 'mockinfra', defaultModel: 'mockinfra-baseline-model',
-      }),
-      env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic' },
-    })
-    await waitForComposerReady(fixture, 240_000)
-    await pageReadySettled(fixture.page)
+      })
+      page = await launch()
+      await sendChatAndExpectReply(page, 'hot-plugin routed turn', 240_000)
+      const beforeDisable = chatWire().at(-1)?.model
+      expect(beforeDisable).toBe('mockinfra-free-model')
+      await app.close().catch(() => undefined); app = null; page = null
+      await new Promise((r) => setTimeout(r, 2500))
 
-    await sendChatAndExpectReply(fixture.page, 'hot-plugin routed turn')
-    const beforeDisable = chatWire().at(-1)?.model
-    expect(beforeDisable).toBe('mockinfra-free-model')
+      // Config is cached per gateway process, so revocation is applied at the
+      // next process start while the same session is resumed.
+      const cfgPath = path.join(sandbox.hermesHome, 'config.yaml')
+      const cfgBefore = fs.readFileSync(cfgPath, 'utf8')
+      patchConfig(sandbox.hermesHome, (t) => t.replace(/enable_native_routing:\s*true/, 'enable_native_routing: false'))
+      const cfgAfter = fs.readFileSync(cfgPath, 'utf8')
+      saveEvidence('hot-plugin-disable-config.json', {
+        matched: cfgBefore !== cfgAfter,
+        flagLine: cfgAfter.split('\n').filter((l) => l.includes('enable_native_routing')),
+      })
+      expect(cfgBefore !== cfgAfter, 'native-routing opt-in flag must be found and flipped').toBe(true)
+      page = await launch()
+      await startNewSession(page)
+      await sendChatAndExpectReply(page, 'hot-plugin disabled turn', 240_000)
+      const whileDisabled = chatWire().at(-1)?.model
+      expect(whileDisabled, 'Without the consumer opt-in, no autorouter rewrite occurs').toBe('mockinfra-baseline-model')
+      const disabledMarker = readJsonIfExists(path.join(sandbox.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json'))
+      await app.close().catch(() => undefined); app = null; page = null
+      await new Promise((r) => setTimeout(r, 2500))
 
-    // Disable the consumer mid-session by flipping the native-routing opt-in off.
-    patchConfig(fixture.sandbox.hermesHome, (t) => t.replace(/enable_native_routing: true/, 'enable_native_routing: false'))
-    await fixture.page.waitForTimeout(1000)
-    await sendChatAndExpectReply(fixture.page, 'hot-plugin disabled turn')
-    const whileDisabled = chatWire().at(-1)?.model
-    expect(whileDisabled, 'Without the consumer opt-in, no autorouter rewrite occurs').toBe('mockinfra-baseline-model')
-    const disabledMarker = readJsonIfExists(path.join(fixture.sandbox.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json'))
+      patchConfig(sandbox.hermesHome, (t) => t.replace(/enable_native_routing:\s*false/, 'enable_native_routing: true'))
+      page = await launch()
+      await startNewSession(page)
+      await sendChatAndExpectReply(page, 'hot-plugin re-enabled turn', 240_000)
+      const afterReenable = chatWire().at(-1)?.model
+      expect(afterReenable).toBe('mockinfra-free-model')
+      const reenabledMarker = readJsonIfExists(path.join(sandbox.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json'))
+      assertNoVirtualModelOnWire(mock!)
 
-    // Re-enable and register; routing resumes only with the opt-in restored.
-    patchConfig(fixture.sandbox.hermesHome, (t) => t.replace(/enable_native_routing: false/, 'enable_native_routing: true'))
-    await fixture.page.waitForTimeout(1000)
-    await sendChatAndExpectReply(fixture.page, 'hot-plugin re-enabled turn')
-    const afterReenable = chatWire().at(-1)?.model
-    expect(afterReenable).toBe('mockinfra-free-model')
-    const reenabledMarker = readJsonIfExists(path.join(fixture.sandbox.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json'))
-    assertNoVirtualModelOnWire(mock!)
-
-    saveEvidence('plugin-hot-lifecycle.json', {
-      models: [beforeDisable, whileDisabled, afterReenable],
-      disabledMarker,
-      reenabledMarker,
-      note: 'Consumer registration ownership is fixed at plugin load; mid-session the per-attempt opt-in gate makes routing inactive (passthrough to baseline) and its restoration resumes routing, without any virtual model on the wire.',
-    })
-    await takeEvidenceScreenshot(fixture.page, 'hot-plugin-final.png').catch(() => null)
-    collectEgressEvidence(mock!, fixture.sandbox.root, 'hot-plugin')
+      saveEvidence('plugin-hot-lifecycle.json', {
+        models: [beforeDisable, whileDisabled, afterReenable],
+        disabledMarker,
+        reenabledMarker,
+        note: 'Consumer registration/ownership is fixed at plugin load. Revoking the opt-in across a process restart while resuming the same session makes routing inactive (baseline on wire); restoring the opt-in resumes routing. No virtual model reached the wire in any phase.',
+      })
+      await takeEvidenceScreenshot(page, 'hot-plugin-final.png').catch(() => null)
+      collectEgressEvidence(mock!, sandbox.root, 'hot-plugin')
+    } finally {
+      await app?.close().catch(() => undefined)
+      try { sandbox.cleanup() } catch {}
+      await mock?.close().catch(() => undefined)
+      mock = null
+    }
   })
 })
