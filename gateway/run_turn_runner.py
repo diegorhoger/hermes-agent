@@ -1461,41 +1461,27 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # authority is in effect. Must run before the agent is built so no virtual
         # autorouter model ever reaches provider construction.
         try:
-            from gateway.autorouter_turn_route import resolve_autorouter_for_gateway_turn
+            from gateway.autorouter_turn_route import (
+                resolve_autorouter_for_gateway_turn,
+                turn_has_explicit_route_authority,
+            )
             from gateway.session_cli_turn import cli_turn
 
             _session_override = runner._session_model_override(ctx.session_key) if ctx.session_key else None
             _one_turn_override = cli_turn(getattr(ctx, "inbound_message_id", None)).get("model_override")
-            _policy_explicit = False
-            if policy is not None:
-                try:
-                    import json as _json
-                    _req = _json.loads(getattr(policy, "request_json", "") or "{}")
-                except Exception:
-                    _req = {}
-                # A model/provider chosen explicitly for this session (e.g. composer/UI pick sent in
-                # session.create, or an explicit launch/model request) must remain authoritative and
-                # must not be rewritten by ordinary-session pre-inference routing. The profile's
-                # configured/default model is represented by policy config/default resolution, not by
-                # an explicit request field, so Mode B can still route ordinary sessions.
-                if isinstance(_req, dict):
-                    _req_model = _req.get("model")
-                    _req_provider = _req.get("provider")
-                    _req_model_requested = _req.get("model_requested")
-                    _req_base_url = _req.get("base_url")
-                    _policy_explicit = bool(
-                        (isinstance(_req_model, str) and _req_model.strip())
-                        or (isinstance(_req_provider, str) and _req_provider.strip() and _req_provider.strip().lower() != "auto")
-                        or (isinstance(_req_model_requested, str) and _req_model_requested.strip())
-                        or (isinstance(_req_base_url, str) and _req_base_url.strip())
-                    )
-                # Following a profile does not cancel an explicit session-create pick.
-                # build_policy records those choices in request_json even when the
-                # followed profile later changes. Preserve request authority here.
+            # A model/provider/endpoint chosen explicitly for this session (composer pick,
+            # API request, launch/model switch) stays authoritative: build_policy records it
+            # in request_json even for profile-following sessions, and a later profile change
+            # does not cancel it. Unreadable authority metadata fails closed. The shared
+            # helper owns this boundary and is regression-tested directly.
+            _has_explicit = turn_has_explicit_route_authority(
+                request_json=getattr(policy, "request_json", "") if policy is not None else None,
+                session_model_override=_session_override,
+                one_turn_override=_one_turn_override,
+            )
             # Runtime/session-explicit picks must never be rewritten by ordinary-session pre-inference
             # routing. Explicitly selected session policy models/providers are authoritative; ordinary
             # configured/default sessions remain routable in Mode B.
-            _has_explicit = bool(_session_override) or bool(_one_turn_override) or bool(_policy_explicit)
             model, runtime_kwargs = resolve_autorouter_for_gateway_turn(
                 model=model,
                 runtime_kwargs=runtime_kwargs,

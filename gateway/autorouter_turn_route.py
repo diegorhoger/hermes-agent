@@ -14,6 +14,80 @@ from typing import Any, Optional
 log = logging.getLogger(__name__)
 
 
+def request_route_authority(request_json: str | None) -> str:
+    """Classify the route authority carried by a frozen session-create request.
+
+    ``build_policy`` records the client's create fields verbatim in
+    ``request_json``; a later session model switch stamps ``model_requested``
+    there too. This is the only place that decides whether a session picked its
+    own route, so it must stay independent of the profile the session follows:
+    a followed profile can change underneath a still-authoritative create pick.
+
+    Returns one of:
+      * ``"explicit"`` — a model, non-auto provider, endpoint or recorded model
+        switch is present; the user's route is authoritative.
+      * ``"ordinary"`` — the request is readable and carries no route pick;
+        ordinary-session pre-inference routing (Mode B) remains eligible.
+      * ``"unavailable"`` — authority metadata is malformed or is not a JSON
+        object. Callers must not treat this as grounds to rewrite the route.
+    """
+    text = request_json if isinstance(request_json, str) else ""
+    text = text.strip() or "{}"
+    try:
+        import json
+
+        req = json.loads(text)
+    except Exception:
+        return "unavailable"
+    if not isinstance(req, dict):
+        return "unavailable"
+
+    model = req.get("model")
+    provider = req.get("provider")
+    model_requested = req.get("model_requested")
+    base_url = req.get("base_url")
+    explicit = bool(
+        (isinstance(model, str) and model.strip())
+        or (
+            isinstance(provider, str)
+            and provider.strip()
+            and provider.strip().lower() != "auto"
+        )
+        or (isinstance(model_requested, str) and model_requested.strip())
+        or (isinstance(base_url, str) and base_url.strip())
+    )
+    return "explicit" if explicit else "ordinary"
+
+
+def has_explicit_request_route(request_json: str | None) -> bool:
+    """True when a create request carries an authoritative route pick.
+
+    Unreadable authority metadata fails closed: it is never an invitation for
+    AutoRouter to rewrite a route whose provenance cannot be established.
+    """
+    return request_route_authority(request_json) != "ordinary"
+
+
+def turn_has_explicit_route_authority(
+    *,
+    request_json: str | None,
+    session_model_override: Any = None,
+    one_turn_override: Any = None,
+) -> bool:
+    """Single owner of turn route authority precedence.
+
+    A user-selected create request, a committed session model switch, or a
+    one-turn override each make the route authoritative. Any of them prevents
+    ordinary-session pre-inference routing from rewriting the model, provider
+    or endpoint. Unreadable request metadata fails closed.
+    """
+    return bool(
+        session_model_override
+        or one_turn_override
+        or has_explicit_request_route(request_json)
+    )
+
+
 def _bounded(value: Any, limit: int) -> str:
     text = str(value if value is not None else "")
     text = "".join(char for char in text if ord(char) >= 32 and ord(char) != 127)

@@ -43,6 +43,27 @@ function verifyArchive(filePath: string): void {
   }
 }
 
+/** Defense in depth: never let a member path or symlink resolve outside the extraction root. */
+export function assertArchivePathsSafe(filePath: string): void {
+  const names: string = execFileSync('tar', ['-tzf', filePath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  for (const raw of names.split('\n')) {
+    const entry = raw.trim()
+    if (!entry) continue
+    if (entry.startsWith('/') || /^[A-Za-z]:[\\/]/.test(entry)) {
+      throw new Error(`Pinned archive contains an absolute path; refusing extraction: ${entry}`)
+    }
+    if (entry.split('/').some((part) => part === '..')) {
+      throw new Error(`Pinned archive contains a parent traversal path; refusing extraction: ${entry}`)
+    }
+  }
+  const verbose: string = execFileSync('tar', ['-tvzf', filePath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  for (const line of verbose.split('\n')) {
+    if (line && line[0] === 'l') {
+      throw new Error(`Pinned archive contains a symlink entry; refusing extraction: ${line.slice(0, 200)}`)
+    }
+  }
+}
+
 function looksLikePinnedAutorouterSource(dir: string): boolean {
   if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return false
   return fs.existsSync(path.join(dir, 'plugin.yaml')) && fs.existsSync(path.join(dir, '__init__.py'))
@@ -61,6 +82,11 @@ function findExtractedSourceRoot(extractDir: string): string {
 }
 
 let cachedExtractedSource: string | null = null
+
+/** Test seam: isolated acceptance checks must not inherit another run's extraction. */
+export function resetPinnedAutorouterSourceCacheForTests(): void {
+  cachedExtractedSource = null
+}
 
 export function resolvePinnedAutorouterSource(): string {
   if (cachedExtractedSource && fs.existsSync(cachedExtractedSource)) return cachedExtractedSource
@@ -83,6 +109,7 @@ export function resolvePinnedAutorouterSource(): string {
   const archiveEnv = (process.env.AUTOROUTER_PINNED_ARCHIVE || '').trim()
   const archivePath = path.resolve(archiveEnv || BUNDLED_PINNED_ARCHIVE)
   verifyArchive(archivePath)
+  assertArchivePathsSafe(archivePath)
 
   const extractBase = fs.mkdtempSync(path.join(os.tmpdir(), 'autorouter-pinned-src-'))
   execFileSync('tar', ['-xzf', archivePath, '-C', extractBase], { stdio: 'pipe' })

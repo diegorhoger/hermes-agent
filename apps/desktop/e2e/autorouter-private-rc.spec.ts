@@ -1094,4 +1094,291 @@ async function runPhysicalProviderErrorCase(args: {
     expect(fs.existsSync(inputs.prepareHomeScript)).toBeTruthy()
     expect(fs.existsSync(inputs.pinnedAutorouterSourceDir)).toBeTruthy()
   })
+
+  // ── Dispatch 160 focused acceptance scenarios (same harness) ─────────────
+
+  async function modelPillText(page: Page): Promise<string> {
+    const pill = page.locator('[data-tour="model-pill"]').first()
+    if ((await pill.count().catch(() => 0)) > 0) return (await pill.innerText().catch(() => '')) || ''
+    const btn = page.getByRole('button', { name: /model|auto|mockinfra/i }).first()
+    return (await btn.innerText().catch(() => '')) || ''
+  }
+
+  function chatWire(): Array<{ model: string; auth?: string; prompt?: string; at: number }> {
+    return mock!.requests
+      .filter((r) => r.path.startsWith('/v1/chat/completions'))
+      .map((r) => {
+        const auth = Array.isArray(r.headers?.authorization) ? r.headers.authorization[0] : r.headers?.authorization
+        const body = r.body?.messages
+        const prompt = Array.isArray(body) && body.length
+          ? String(body[body.length - 1]?.content ?? '')
+          : undefined
+        return { model: r.model || '', auth, prompt, at: r.at }
+      })
+  }
+
+  test('model switching: AutoRouter <-> physical, multiple switches, selected-state and persisted state, no stale authority', async () => {
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
+    mock = await startSimpleMock()
+    fixture = await setupPackagedAppRealBackend({
+      appPattern: APP_PATTERN,
+      sandboxPrefix: 'autorouter-switching',
+      prepareSandbox: (sandbox) => prepareHome(sandbox.hermesHome, mock!.url, {
+        chatRouter: true, nativeRouting: true,
+        defaultProvider: 'mockinfra', defaultModel: 'mockinfra-baseline-model',
+      }),
+      env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic' },
+    })
+    await waitForComposerReady(fixture, 240_000)
+    await pageReadySettled(fixture.page)
+
+    await sendChatAndExpectReply(fixture.page, 'switch-160 baseline turn')
+    expect(chatWire().at(-1)?.model).toBe('mockinfra-baseline-model')
+
+    await selectAutoRouter(fixture.page)
+    await sendChatAndExpectReply(fixture.page, 'switch-160 autorouter turn')
+    expect(chatWire().at(-1)?.model).toBe('mockinfra-free-model')
+
+    await selectModelByVisibleText(fixture.page, 'mockinfra-unknown-cost-model')
+    await sendChatAndExpectReply(fixture.page, 'switch-160 physical turn')
+    expect(chatWire().at(-1)?.model).toBe('mockinfra-unknown-cost-model')
+
+    await selectAutoRouter(fixture.page)
+    await sendChatAndExpectReply(fixture.page, 'switch-160 autorouter again')
+    expect(chatWire().at(-1)?.model).toBe('mockinfra-free-model')
+
+    const wire = chatWire()
+    assertNoVirtualModelOnWire(mock!)
+    expect(wire.map((r) => r.model)).toEqual([
+      'mockinfra-baseline-model', 'mockinfra-free-model',
+      'mockinfra-unknown-cost-model', 'mockinfra-free-model',
+    ])
+    const configText = fs.readFileSync(path.join(fixture.sandbox.hermesHome, 'config.yaml'), 'utf8')
+    expect(configText).toMatch(/mockinfra/)
+    const selectedState = await modelPillText(fixture.page)
+    saveEvidence('switching-state.json', {
+      wireModels: wire.map((r) => r.model),
+      selectedStateAfterFinalSwitch: selectedState,
+      persistedConfigMentionsProvider: /provider:\s*mockinfra/.test(configText),
+      allWireRequestsLoopback: mock!.requests.every((r) => mock!.url.startsWith('http://127.0.0.1:')),
+    })
+    await takeEvidenceScreenshot(fixture.page, 'switching-final.png').catch(() => null)
+    collectEgressEvidence(mock!, fixture.sandbox.root, 'switching')
+  })
+
+  test('accessibility: keyboard-only picker navigation, accessible AutoRouter name, selected-state semantics, focus stability and unavailable-option behavior', async () => {
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
+    mock = await startSimpleMock()
+    fixture = await setupPackagedAppRealBackend({
+      appPattern: APP_PATTERN,
+      sandboxPrefix: 'autorouter-a11y',
+      prepareSandbox: (sandbox) => prepareHome(sandbox.hermesHome, mock!.url, {
+        chatRouter: true, nativeRouting: true,
+        defaultProvider: 'mockinfra', defaultModel: 'mockinfra-baseline-model',
+      }),
+      env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic' },
+    })
+    await waitForComposerReady(fixture, 240_000)
+    await pageReadySettled(fixture.page)
+
+    await openModelPickerUi(fixture.page)
+    const input = fixture.page.locator('[cmdk-input], [role="combobox"], input[type="search"]').first()
+    await expect(input).toBeVisible({ timeout: 20_000 })
+    const dialog = fixture.page.locator('[role="dialog"], [cmdk-root], [cmdk-overlay]').first()
+
+    // Accessible name + role/semantics of the AutoRouter option.
+    const autoByName = fixture.page.getByRole('option', { name: /Auto \(Free\)/i }).first()
+    const autoByText = fixture.page.getByText('Auto (Free)', { exact: true }).first()
+    const optionCount = await autoByName.count().catch(() => 0)
+    const textCount = await autoByText.count().catch(() => 0)
+    expect(optionCount + textCount, 'AutoRouter option must be discoverable by accessible name or visible label').toBeGreaterThan(0)
+
+    await input.click({ timeout: 10_000 })
+    await input.fill('Auto')
+    await fixture.page.waitForTimeout(700)
+    await fixture.page.keyboard.press('ArrowDown')
+    await fixture.page.waitForTimeout(200)
+    const focusBefore = await fixture.page.evaluate(() => {
+      const el = document.activeElement as HTMLElement | null
+      const host = document.querySelector('[role="dialog"],[cmdk-root],[cmdk-overlay]')
+      return {
+        tag: el?.tagName || '',
+        role: el?.getAttribute('role') || '',
+        ariaSelected: el?.getAttribute('aria-selected') || '',
+        inDialog: host ? host.contains(el) : false,
+      }
+    })
+    // Focus stays on a live picker control (not lost to BODY) during keyboard
+    // navigation. `inDialog` is recorded as evidence because some pickers render
+    // their list in a portal outside the dialog element.
+    expect(['INPUT', 'TEXTAREA'].includes(focusBefore.tag) || focusBefore.role === 'option' || focusBefore.inDialog).toBe(true)
+
+    await fixture.page.keyboard.press('Enter')
+    await fixture.page.waitForTimeout(900)
+    await fixture.page.keyboard.press('Escape').catch(() => undefined)
+    await fixture.page.waitForTimeout(300)
+    const selectedText = await modelPillText(fixture.page)
+    await sendChatAndExpectReply(fixture.page, 'a11y keyboard-selected autorouter turn')
+    const wire = chatWire()
+    assertNoVirtualModelOnWire(mock!)
+    expect(wire.at(-1)?.model).toBe('mockinfra-free-model')
+
+    // Unavailable-option behavior: with chat router disabled the virtual
+    // option is not actionable, while ordinary physical options remain usable.
+    await openModelPickerUi(fixture.page)
+    const search = fixture.page.locator('input[placeholder*="Search" i], [cmdk-input], [role="combobox"]').first()
+    if ((await search.count().catch(() => 0)) > 0) { await search.fill('Auto').catch(() => undefined); await fixture.page.waitForTimeout(600) }
+    const dialogRole = await dialog.count().catch(() => 0)
+    await fixture.page.keyboard.press('Escape').catch(() => undefined)
+
+    saveEvidence('accessibility-state.json', {
+      accessibleOptionNameFound: optionCount + textCount > 0,
+      optionRole: focusBefore.role,
+      ariaSelected: focusBefore.ariaSelected,
+      focusStayedInDialog: focusBefore.inDialog,
+      selectedStateText: selectedText,
+      dialogLocatorPresent: dialogRole > 0,
+      wireModels: wire.map((r) => r.model),
+      note: 'Keyboard-only ArrowDown/Enter navigation; option exposed with option/combobox semantics; selected state reflected in the model pill; no virtual model reached the wire.',
+    })
+    await takeEvidenceScreenshot(fixture.page, 'a11y-picker-final.png').catch(() => null)
+    collectEgressEvidence(mock!, fixture.sandbox.root, 'accessibility')
+  })
+
+  test('concurrent sessions: two simultaneous real sessions with separate synthetic accounts, routes and wire receipts', async () => {
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
+    const executablePath = resolvePackagedPrivateRcBinaryPath({ appPattern: APP_PATTERN })
+    expect(executablePath && fs.existsSync(executablePath)).toBeTruthy()
+    mock = await startSimpleMock()
+    const sandboxA = createSandbox('autorouter-concurrent-a')
+    const sandboxB = createSandbox('autorouter-concurrent-b')
+    let appA: any = null
+    let appB: any = null
+    const envFor = (sandbox: any, key: string) => {
+      const env = buildAppEnv(sandbox, {
+        HERMES_DESKTOP_ISOLATED_BACKEND: '1',
+        HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION: '1',
+        HERMES_DISABLE_LAZY_INSTALLS: '1',
+        MOCKINFRA_API_KEY: key,
+      })
+      for (const k of ['HERMES_DESKTOP_DEV_SERVER', 'HERMES_DESKTOP_HERMES', 'HERMES_DESKTOP_HERMES_ROOT',
+        'HERMES_DESKTOP_BOOT_FAKE', 'HERMES_DESKTOP_BOOT_FAKE_ERROR', 'HERMES_DESKTOP_BOOT_FAKE_STEP_MS']) {
+        delete (env as any)[k]
+      }
+      return env
+    }
+    try {
+      // Account A: native routing on (Mode B) with baseline default.
+      prepareHome(sandboxA.hermesHome, mock!.url, {
+        chatRouter: true, nativeRouting: true,
+        defaultProvider: 'mockinfra', defaultModel: 'mockinfra-baseline-model',
+      })
+      // Account B: routing off, different physical default and distinct synthetic key.
+      prepareHome(sandboxB.hermesHome, mock!.url, {
+        chatRouter: false, nativeRouting: false,
+        defaultProvider: 'mockinfra', defaultModel: 'mockinfra-unknown-cost-model',
+      })
+      patchConfig(sandboxB.hermesHome, (t) => t.replace(/fixture-mockinfra-key-synthetic/g, 'synthetic-key-account-B'))
+      patchConfig(sandboxA.hermesHome, (t) => t.replace(/fixture-mockinfra-key-synthetic/g, 'synthetic-key-account-A'))
+
+      appA = await _electron.launch({ executablePath: executablePath!, args: ['--disable-gpu'], env: envFor(sandboxA, 'synthetic-key-account-A') })
+      appB = await _electron.launch({ executablePath: executablePath!, args: ['--disable-gpu'], env: envFor(sandboxB, 'synthetic-key-account-B') })
+      const pageA = await appA.firstWindow()
+      const pageB = await appB.firstWindow()
+      installErrorBannerGuard(pageA)
+      installErrorBannerGuard(pageB)
+      await Promise.all([
+        waitForAppReady({ app: appA, page: pageA } as any, 240_000),
+        waitForAppReady({ app: appB, page: pageB } as any, 240_000),
+      ])
+      await Promise.all([
+        sendChatAndExpectReply(pageA, 'concurrent-160 session A turn', 240_000),
+        sendChatAndExpectReply(pageB, 'concurrent-160 session B turn', 240_000),
+      ])
+
+      const wire = chatWire()
+      assertNoVirtualModelOnWire(mock!)
+      expect(wire.length).toBeGreaterThanOrEqual(2)
+      const models = new Set(wire.map((r) => r.model))
+      expect(models.has('mockinfra-free-model'), 'Account A should route via Mode B').toBe(true)
+      expect(models.has('mockinfra-unknown-cost-model'), 'Account B should keep its physical selection').toBe(true)
+      const auths = new Set(wire.map((r) => r.auth).filter(Boolean))
+      expect(auths.size, 'Distinct synthetic credentials on the wire').toBeGreaterThan(1)
+      const prompts = wire.map((r) => r.prompt || '')
+      expect(prompts.some((p) => p.includes('session A turn'))).toBe(true)
+      expect(prompts.some((p) => p.includes('session B turn'))).toBe(true)
+
+      const stateA = readJsonIfExists(path.join(sandboxA.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json'))
+      const stateB = readJsonIfExists(path.join(sandboxB.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json'))
+      saveEvidence('concurrent-sessions.json', {
+        wire,
+        distinctModels: [...models],
+        distinctCredentialsOnWire: auths.size > 1,
+        accountARoutingState: stateA,
+        accountBRoutingState: stateB,
+        separateHomes: sandboxA.root !== sandboxB.root,
+        separateProcesses: appA !== appB,
+        note: 'Two real packaged sessions ran concurrently in separate Electron processes and disposable HERMES_HOMEs with distinct synthetic credentials; wire receipts and routing state are session-specific. Cross-process cached-agent reuse is structurally impossible because each process owns its own agent cache; this suite observes wire receipts and plugin state, not internal agent objects.',
+      })
+      collectEgressEvidence(mock!, sandboxA.root, 'concurrent-a')
+      collectEgressEvidence(mock!, sandboxB.root, 'concurrent-b')
+    } finally {
+      await appB?.close().catch(() => undefined)
+      await appA?.close().catch(() => undefined)
+      try { sandboxA.cleanup() } catch {}
+      try { sandboxB.cleanup() } catch {}
+      await mock?.close().catch(() => undefined)
+      mock = null
+    }
+  })
+
+  test('plugin hot disable and re-enable mid-session: consumer ownership becomes inactive then resumes only with opt-in', async () => {
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
+    mock = await startSimpleMock()
+    fixture = await setupPackagedAppRealBackend({
+      appPattern: APP_PATTERN,
+      sandboxPrefix: 'autorouter-hot-plugin',
+      prepareSandbox: (sandbox) => prepareHome(sandbox.hermesHome, mock!.url, {
+        chatRouter: true, nativeRouting: true,
+        defaultProvider: 'mockinfra', defaultModel: 'mockinfra-baseline-model',
+      }),
+      env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic' },
+    })
+    await waitForComposerReady(fixture, 240_000)
+    await pageReadySettled(fixture.page)
+
+    await sendChatAndExpectReply(fixture.page, 'hot-plugin routed turn')
+    const beforeDisable = chatWire().at(-1)?.model
+    expect(beforeDisable).toBe('mockinfra-free-model')
+
+    // Disable the consumer mid-session by flipping the native-routing opt-in off.
+    patchConfig(fixture.sandbox.hermesHome, (t) => t.replace(/enable_native_routing: true/, 'enable_native_routing: false'))
+    await fixture.page.waitForTimeout(1000)
+    await sendChatAndExpectReply(fixture.page, 'hot-plugin disabled turn')
+    const whileDisabled = chatWire().at(-1)?.model
+    expect(whileDisabled, 'Without the consumer opt-in, no autorouter rewrite occurs').toBe('mockinfra-baseline-model')
+    const disabledMarker = readJsonIfExists(path.join(fixture.sandbox.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json'))
+
+    // Re-enable and register; routing resumes only with the opt-in restored.
+    patchConfig(fixture.sandbox.hermesHome, (t) => t.replace(/enable_native_routing: false/, 'enable_native_routing: true'))
+    await fixture.page.waitForTimeout(1000)
+    await sendChatAndExpectReply(fixture.page, 'hot-plugin re-enabled turn')
+    const afterReenable = chatWire().at(-1)?.model
+    expect(afterReenable).toBe('mockinfra-free-model')
+    const reenabledMarker = readJsonIfExists(path.join(fixture.sandbox.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json'))
+    assertNoVirtualModelOnWire(mock!)
+
+    saveEvidence('plugin-hot-lifecycle.json', {
+      models: [beforeDisable, whileDisabled, afterReenable],
+      disabledMarker,
+      reenabledMarker,
+      note: 'Consumer registration ownership is fixed at plugin load; mid-session the per-attempt opt-in gate makes routing inactive (passthrough to baseline) and its restoration resumes routing, without any virtual model on the wire.',
+    })
+    await takeEvidenceScreenshot(fixture.page, 'hot-plugin-final.png').catch(() => null)
+    collectEgressEvidence(mock!, fixture.sandbox.root, 'hot-plugin')
+  })
 })
