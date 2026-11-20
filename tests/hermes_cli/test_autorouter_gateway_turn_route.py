@@ -320,3 +320,19 @@ def test_gateway_runtime_conversion_failure_never_falls_back_to_raw_fields(monke
             platform="gateway",
             has_explicit_model_or_provider=False,
         )
+
+
+def test_virtual_selection_refuses_incomplete_physical_route(monkeypatch):
+    """A malformed producer receipt cannot send 'auto-free' on the wire."""
+    monkeypatch.setattr("hermes_cli.autorouter_picker.is_autorouter_pick",
+                        lambda model, provider: model in {"auto-free", "autorouter/auto-free"} or provider == "autorouter")
+    monkeypatch.setattr("hermes_cli.autorouter_picker.actionable", lambda: True)
+    monkeypatch.setattr(
+        "hermes_cli.autorouter_picker.resolve_autorouter_physical",
+        lambda **kwargs: ({"provider": "mockinfra", "base_url": "http://127.0.0.1:9999/v1"}, {"provider": "mockinfra"}),
+    )
+    with pytest.raises(RuntimeError, match="incomplete physical route"):
+        mod.resolve_autorouter_virtual_turn(
+            model="auto-free", runtime_kwargs={"provider": "autorouter"},
+            session_id="s1", session_key="k1", platform="gateway",
+        )
