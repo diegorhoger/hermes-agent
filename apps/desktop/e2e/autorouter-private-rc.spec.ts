@@ -1346,7 +1346,12 @@ async function runPhysicalProviderErrorCase(args: {
     }
   })
 
-  test('plugin disable and re-enable across session lifecycle: consumer is inactive without opt-in and resumes only with opt-in', async () => {
+  // This is RESTART-TIME activation/opt-out, NOT live hot-unload: Hermes caches
+  // plugin config per gateway process, so the opt-in is applied at next process
+  // start while the session resumes. True in-process live unload is covered by
+  // tests/hermes_cli/test_autorouter_plugin_live_unload.py via the host's
+  // PluginManager ownership ledger (no restart).
+  test('plugin restart-time activation/opt-out: routing is inactive without the opt-in and resumes when restored', async () => {
     skipIfInputsMissing()
     requirePrivateRcInputs()
     const executablePath = resolvePackagedPrivateRcBinaryPath({ appPattern: APP_PATTERN })
@@ -1425,7 +1430,7 @@ async function runPhysicalProviderErrorCase(args: {
         models: [beforeDisable, whileDisabled, afterReenable],
         disabledMarker,
         reenabledMarker,
-        note: 'Consumer registration/ownership is fixed at plugin load. Revoking the opt-in across a process restart while resuming the same session makes routing inactive (baseline on wire); restoring the opt-in resumes routing. No virtual model reached the wire in any phase.',
+        note: 'RESTART-TIME activation/opt-out only (not live hot-unload). Hermes caches plugin config per gateway process; revoking the opt-in across a process restart makes routing inactive (baseline on wire), restoring it resumes routing. No virtual model reached the wire in any phase. In-process live unload is covered separately by tests/hermes_cli/test_autorouter_plugin_live_unload.py.',
       })
       await takeEvidenceScreenshot(page, 'hot-plugin-final.png').catch(() => null)
       collectEgressEvidence(mock!, sandbox.root, 'hot-plugin')
