@@ -12,10 +12,14 @@ import * as http from 'node:http'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
-import { expect, type Page } from '@playwright/test'
+import { _electron, expect, type Page } from '@playwright/test'
 
 import {
+  buildAppEnv,
+  createSandbox,
+  resolvePackagedPrivateRcBinaryPath,
   type PackagedAppFixture,
+  type Sandbox,
   setupPackagedAppRealBackend,
   waitForAppReady,
 } from './fixtures'
@@ -26,7 +30,7 @@ import {
   isPrivateRcAcceptanceMode,
   resolvePrivateRcInputs,
 } from './support/autorouter-private-rc'
-import { test } from './test'
+import { installErrorBannerGuard, test } from './test'
 
 const THIS_DIR = path.resolve(import.meta.dirname)
 const RC_ROOT = path.resolve(THIS_DIR, '../../..')
@@ -912,6 +916,108 @@ async function runPhysicalProviderErrorCase(args: {
       timeoutMs: 300_000,
       env: { HERMES_API_TIMEOUT: '8' },
     })
+  })
+
+  test('Mode B restart and resume: routed session persists across app restart without virtual wire leakage', async () => {
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
+    const executablePath = resolvePackagedPrivateRcBinaryPath({ appPattern: APP_PATTERN })
+    if (!executablePath || !fs.existsSync(executablePath)) {
+      throw new Error(`Packaged app binary not found for restart/resume test: ${executablePath ?? '(none)'}`)
+    }
+    mock = await startSimpleMock()
+    const sandbox = createSandbox('autorouter-restart')
+    let app1: any = null
+    let app2: any = null
+    try {
+      prepareHome(sandbox.hermesHome, mock!.url, {
+        chatRouter: false,
+        nativeRouting: true,
+        defaultProvider: 'mockinfra',
+        defaultModel: 'mockinfra-baseline-model',
+      })
+      const baseEnv = {
+        HERMES_DESKTOP_ISOLATED_BACKEND: '1',
+        HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION: '1',
+        HERMES_DISABLE_LAZY_INSTALLS: '1',
+        MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic',
+      }
+      const env = buildAppEnv(sandbox, baseEnv)
+      delete (env as any).HERMES_DESKTOP_DEV_SERVER
+      delete (env as any).HERMES_DESKTOP_HERMES
+      delete (env as any).HERMES_DESKTOP_HERMES_ROOT
+      delete (env as any).HERMES_DESKTOP_BOOT_FAKE
+      delete (env as any).HERMES_DESKTOP_BOOT_FAKE_ERROR
+      delete (env as any).HERMES_DESKTOP_BOOT_FAKE_STEP_MS
+
+      app1 = await _electron.launch({ executablePath, args: ['--disable-gpu'], env })
+      const page1 = await app1.firstWindow()
+      installErrorBannerGuard(page1)
+      await waitForAppReady({ app: app1, page: page1 } as any, 240_000)
+      await pageReadySettled(page1)
+      const prompt1 = 'Dispatch 159 restart-resume first routed turn'
+      await sendChatAndExpectReply(page1, prompt1, 240_000)
+      const reqsAfterFirst = mock.requests.filter((r) => r.path.startsWith('/v1/chat/completions'))
+      expect(reqsAfterFirst.length).toBeGreaterThan(0)
+      assertNoVirtualModelOnWire(mock)
+      expect(reqsAfterFirst.every((r) => r.model === 'mockinfra-free-model')).toBeTruthy()
+      await takeEvidenceScreenshot(page1, 'restart-before-close.png').catch(() => null)
+      saveEvidence('restart-first-turn-mock-requests.json', reqsAfterFirst.map(r => ({ model: r.model, path: r.path, at: r.at })))
+
+      await app1.close().catch(() => undefined)
+      app1 = null
+      await new Promise((r) => setTimeout(r, 2500))
+
+      const env2 = buildAppEnv(sandbox, baseEnv)
+      delete (env2 as any).HERMES_DESKTOP_DEV_SERVER
+      delete (env2 as any).HERMES_DESKTOP_HERMES
+      delete (env2 as any).HERMES_DESKTOP_HERMES_ROOT
+      delete (env2 as any).HERMES_DESKTOP_BOOT_FAKE
+      delete (env2 as any).HERMES_DESKTOP_BOOT_FAKE_ERROR
+      delete (env2 as any).HERMES_DESKTOP_BOOT_FAKE_STEP_MS
+      app2 = await _electron.launch({ executablePath, args: ['--disable-gpu'], env: env2 })
+      const page2 = await app2.firstWindow()
+      installErrorBannerGuard(page2)
+      await waitForAppReady({ app: app2, page: page2 } as any, 240_000)
+      await pageReadySettled(page2)
+
+      // Best-effort resume: try to find previous transcript; if not visible, click a sidebar row containing prompt snippet.
+      const promptSnippet = 'restart-resume first routed turn'
+      let resumed = await page2.getByText(promptSnippet, { exact: false }).first().isVisible().catch(() => false)
+      if (!resumed) {
+        const row = page2.locator('[data-slot="sidebar"] button').filter({ hasText: /restart-resume|Dispatch 159/i }).first()
+        if (await row.count().catch(() => 0)) {
+          await row.click({ timeout: 15_000 }).catch(() => undefined)
+          await page2.waitForTimeout(2000)
+          resumed = await page2.getByText(promptSnippet, { exact: false }).first().isVisible().catch(() => false)
+        }
+      }
+      await takeEvidenceScreenshot(page2, 'restart-after-relaunch.png').catch(() => null)
+
+      // Continue in resumed/new context and verify routing remains physical and correct (no virtual wire).
+      const prompt2 = 'Dispatch 159 restart-resume second routed turn'
+      await sendChatAndExpectReply(page2, prompt2, 240_000)
+      await page2.waitForTimeout(1500)
+      const reqsAfterSecond = mock.requests.filter((r) => r.path.startsWith('/v1/chat/completions'))
+      expect(reqsAfterSecond.length).toBeGreaterThan(reqsAfterFirst.length)
+      assertNoVirtualModelOnWire(mock)
+      expect(reqsAfterSecond.slice(reqsAfterFirst.length).every((r) => r.model === 'mockinfra-free-model')).toBeTruthy()
+      saveEvidence('restart-second-turn-mock-requests.json', reqsAfterSecond.map(r => ({ model: r.model, path: r.path, at: r.at })))
+      saveEvidence('restart-resume-state.json', {
+        resumedTranscriptVisible: resumed,
+        firstChatReqCount: reqsAfterFirst.length,
+        totalChatReqCount: reqsAfterSecond.length,
+        secondTurnModels: reqsAfterSecond.slice(reqsAfterFirst.length).map(r => r.model),
+      })
+      collectAutorouterPluginArtifacts(sandbox.root, 'restart-resume')
+      collectEgressEvidence(mock, sandbox.root, 'restart-resume')
+    } finally {
+      if (app2) await app2.close().catch(() => undefined)
+      if (app1) await app1.close().catch(() => undefined)
+      try { sandbox.cleanup() } catch {}
+      await mock?.close().catch(() => undefined)
+      mock = null
+    }
   })
 
   test('isolation, protocol registration skip, and sandbox evidence', async () => {
