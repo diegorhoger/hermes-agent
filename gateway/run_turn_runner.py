@@ -1482,7 +1482,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     _follows_profile = bool(getattr(policy, "follows_profile", False))
                 except Exception:
                     _follows_profile = False
-                _policy_model = getattr(policy, "model", None)
                 if isinstance(_req, dict):
                     _req_model = _req.get("model")
                     _req_provider = _req.get("provider")
@@ -1492,11 +1491,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                         or (isinstance(_req_provider, str) and _req_provider.strip() and _req_provider.strip().lower() != "auto")
                         or (isinstance(_req_model_requested, str) and _req_model_requested.strip())
                     )
-                # Defensive: a non-following session created with an explicit frozen model (e.g. UI
-                # composer selection) is authoritative even if request_json shape varies; ordinary
-                # sessions without an explicit create-time model keep policy.model unset/None.
-                if not _policy_explicit and not _follows_profile and isinstance(_policy_model, str) and _policy_model.strip():
-                    _policy_explicit = True
                 # follow_profile_config sessions re-read the profile's current route each turn;
                 # an initial model field may be present but should not block profile-following
                 # Mode B routing unless a stronger explicit/runtime override exists.
