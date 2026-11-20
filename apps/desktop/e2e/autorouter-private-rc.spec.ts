@@ -1440,4 +1440,79 @@ async function runPhysicalProviderErrorCase(args: {
       mock = null
     }
   })
+
+  test('accessibility narrow viewport: model picker keeps accessible AutoRouter option and keyboard selection', async () => {
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
+    mock = await startSimpleMock()
+    fixture = await setupPackagedAppRealBackend({
+      appPattern: APP_PATTERN,
+      sandboxPrefix: 'autorouter-narrow-viewport',
+      prepareSandbox: (sandbox) => prepareHome(sandbox.hermesHome, mock!.url, {
+        chatRouter: true, nativeRouting: false,
+        defaultProvider: 'mockinfra', defaultModel: 'mockinfra-baseline-model',
+      }),
+      env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic' },
+    })
+    await waitForComposerReady(fixture, 240_000)
+    await pageReadySettled(fixture.page)
+
+    await fixture.page.setViewportSize({ width: 390, height: 844 })
+    await fixture.page.waitForTimeout(1200)
+
+    await openModelPickerUi(fixture.page)
+    const autoMenuItem = fixture.page.getByRole('menuitem', { name: /Auto \(Free\)/i }).first()
+    const autoOption = fixture.page.getByRole('option', { name: /Auto \(Free\)/i }).first()
+    const menuItemVisible = await autoMenuItem.isVisible().catch(() => false)
+    const optionVisible = await autoOption.isVisible().catch(() => false)
+    expect(menuItemVisible || optionVisible,
+      'AutoRouter must keep an accessible role/name in a narrow viewport').toBe(true)
+
+    const input = fixture.page.locator('input[placeholder*="Search" i], [cmdk-input], [role="combobox"], input[type="search"]').first()
+    await expect(input).toBeVisible({ timeout: 20_000 })
+    await input.click({ timeout: 10_000 })
+    await input.fill('Auto')
+    await fixture.page.waitForTimeout(700)
+    await fixture.page.keyboard.press('ArrowDown')
+    await fixture.page.keyboard.press('Enter')
+    await fixture.page.waitForTimeout(900)
+    await fixture.page.keyboard.press('Escape').catch(() => undefined)
+    await fixture.page.waitForTimeout(300)
+
+    // The model pill is intentionally collapsed at 390px, so selected state is
+    // read from the picker's own accessible item after re-opening it.
+    await openModelPickerUi(fixture.page)
+    const selectedItem = fixture.page.getByRole('menuitem', { name: /Auto \(Free\)/i }).first()
+    const selectedOption = fixture.page.getByRole('option', { name: /Auto \(Free\)/i }).first()
+    const current = (await selectedItem.count().catch(() => 0)) > 0 ? selectedItem : selectedOption
+    expect(await current.count(), 'selected AutoRouter item must remain queryable by accessible role/name').toBeGreaterThan(0)
+    const selectedSemantics = await current.evaluate((el) => ({
+      ariaSelected: (el as HTMLElement).getAttribute('aria-selected'),
+      dataState: (el as HTMLElement).getAttribute('data-state'),
+      ariaChecked: (el as HTMLElement).getAttribute('aria-checked'),
+    }))
+    saveEvidence('narrow-viewport-selected-state.json', selectedSemantics)
+    await fixture.page.keyboard.press('Escape').catch(() => undefined)
+    await fixture.page.waitForTimeout(300)
+
+    await sendChatAndExpectReply(fixture.page, 'narrow-viewport autorouter turn')
+    const wire = chatWire()
+    assertNoVirtualModelOnWire(mock!)
+    expect(wire.at(-1)?.model).toBe('mockinfra-free-model')
+
+    const overflow = await fixture.page.evaluate(() => ({
+      innerWidth: window.innerWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+    }))
+    saveEvidence('narrow-viewport-accessibility.json', {
+      viewport: { width: 390, height: 844 },
+      accessibleRole: menuItemVisible ? 'menuitem' : 'option',
+      selectedSemantics,
+      wireModels: wire.map((r) => r.model),
+      overflow,
+      note: 'Narrow-viewport picker keeps the accessible AutoRouter option/menuitem and keyboard selection; the resolved physical model reached the localhost mock and no virtual identifier was sent.',
+    })
+    await takeEvidenceScreenshot(fixture.page, 'narrow-viewport-picker.png').catch(() => null)
+    collectEgressEvidence(mock!, fixture.sandbox.root, 'narrow-viewport')
+  })
 })
