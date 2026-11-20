@@ -1466,7 +1466,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
 
             _session_override = runner._session_model_override(ctx.session_key) if ctx.session_key else None
             _one_turn_override = cli_turn(getattr(ctx, "inbound_message_id", None)).get("model_override")
-            _has_explicit = bool(_session_override) or bool(_one_turn_override) or bool(policy and getattr(policy, "model", None))
+            # Explicit per-session/user picks (model overrides, one-turn overrides, or a non-following
+            # policy with a pinned model) must never be rewritten by ordinary-session pre-inference routing.
+            _policy_pinned_model = bool(
+                policy
+                and getattr(policy, "model", None)
+                and not getattr(policy, "follows_profile", False)
+            )
+            _has_explicit = bool(_session_override) or bool(_one_turn_override) or _policy_pinned_model
             model, runtime_kwargs = resolve_autorouter_for_gateway_turn(
                 model=model,
                 runtime_kwargs=runtime_kwargs,
