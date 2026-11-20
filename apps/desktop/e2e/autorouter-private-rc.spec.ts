@@ -317,7 +317,7 @@ function collectEgressEvidence(mock: SimpleMock, sandboxRoot: string, label: str
 }
 
 async function expectUiErrorOrRefusal(page: Page, timeoutMs = 120_000): Promise<void> {
-  const patterns = [/error/i, /refus/i, /fail/i, /unavailable/i, /not eligible/i, /no eligible/i, /autorouter/i, /rate.?limit/i, /429/]
+  const patterns = [/error/i, /refus/i, /fail/i, /unavailable/i, /not eligible/i, /no eligible/i, /autorouter/i, /rate.?limit/i, /429/, /timeout/i, /timed out/i, /retrying/i, /waiting on provider/i]
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     for (const pat of patterns) {
@@ -347,6 +347,7 @@ async function runPhysicalProviderErrorCase(args: {
   mockOpts: { chatStatus?: number; chatDelayMs?: number; chatBody?: any; chatBodyText?: string; destroySocket?: boolean }
   prompt: string
   timeoutMs?: number
+  env?: Record<string, string>
 }): Promise<void> {
   mock = await startSimpleMock(args.mockOpts)
   fixture = await setupPackagedAppRealBackend({
@@ -355,7 +356,7 @@ async function runPhysicalProviderErrorCase(args: {
     prepareSandbox: (sandbox) => {
       prepareHome(sandbox.hermesHome, mock!.url, { chatRouter: false, nativeRouting: true, defaultProvider: 'mockinfra', defaultModel: 'mockinfra-free-model' })
     },
-    env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic' },
+    env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic', ...(args.env || {}) },
   })
   await waitForComposerReady(fixture, 240_000)
   await pageReadySettled(fixture.page)
@@ -710,6 +711,19 @@ async function runPhysicalProviderErrorCase(args: {
       mockOpts: { destroySocket: true },
       prompt: 'Dispatch 158 transport failure provider error proof',
       timeoutMs: 240_000,
+    })
+  })
+
+  test('request timeout to physical provider: no virtual model on wire and UI surfaces timeout/error state', async () => {
+    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
+    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    await runPhysicalProviderErrorCase({
+      name: 'request timeout',
+      label: 'http-timeout',
+      mockOpts: { chatDelayMs: 30_000 },
+      prompt: 'Dispatch 158 request timeout provider proof',
+      timeoutMs: 300_000,
+      env: { HERMES_API_TIMEOUT: '8' },
     })
   })
 
