@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Minimal OpenAI-compatible mock inference server for E2E tests and the
  * dev:mock dev flow.

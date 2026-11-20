@@ -1,6 +1,10 @@
 /**
- * AUTOROUTER_HERMES Dispatch 158 — real Desktop E2E acceptance for the private
- * bundled RC (packaged app, real embedded backend, localhost mock inference).
+ * AUTOROUTER_HERMES Dispatch 159 — reproducible private RC packaged Desktop E2E
+ * acceptance (packaged app, real embedded backend, localhost mock inference).
+ *
+ * Inputs: versioned prepare script + pinned AutoRouter archive/source (offline).
+ * In private-RC acceptance mode (AUTOROUTER_PRIVATE_RC=1) missing inputs fail
+ * loudly; ordinary runs may skip when not configured.
  */
 import { execFileSync } from 'node:child_process'
 import * as fs from 'node:fs'
@@ -15,22 +19,42 @@ import {
   setupPackagedAppRealBackend,
   waitForAppReady,
 } from './fixtures'
+import {
+  AUTOROUTER_ARCHIVE_SHA256,
+  AUTOROUTER_PINNED_SHA,
+  getMissingPrivateRcInputsReason,
+  isPrivateRcAcceptanceMode,
+  resolvePrivateRcInputs,
+} from './support/autorouter-private-rc'
 import { test } from './test'
 
 const THIS_DIR = path.resolve(import.meta.dirname)
 const RC_ROOT = path.resolve(THIS_DIR, '../../..')
-const DISPATCH_ROOT = path.resolve(RC_ROOT, '..')
-const PINNED_AUTOROUTER = path.resolve(
-  DISPATCH_ROOT,
-  'autorouter-pinned-cdaef496501eadccdde1ac250ef1a18d5b1fd402',
-)
-const PREPARE_HOME_SCRIPT = path.resolve(
-  DISPATCH_ROOT,
-  'artifacts/e2e-158/prepare_autorouter_home.py',
-)
-const EVIDENCE_DIR = path.resolve(DISPATCH_ROOT, 'artifacts/e2e-158')
+const PRIVATE_RC_MODE = isPrivateRcAcceptanceMode()
+const MISSING_PRIVATE_RC_INPUTS = getMissingPrivateRcInputsReason()
+if (PRIVATE_RC_MODE && MISSING_PRIVATE_RC_INPUTS) {
+  throw new Error(
+    `[autorouter-private-rc] AUTOROUTER_PRIVATE_RC acceptance mode requires inputs: ${MISSING_PRIVATE_RC_INPUTS}`,
+  )
+}
+const PRIVATE_RC_INPUTS = MISSING_PRIVATE_RC_INPUTS ? null : resolvePrivateRcInputs(RC_ROOT)
+const SKIP_REASON = !PRIVATE_RC_MODE && MISSING_PRIVATE_RC_INPUTS
+  ? `private RC inputs not configured: ${MISSING_PRIVATE_RC_INPUTS}`
+  : null
+const PINNED_AUTOROUTER = PRIVATE_RC_INPUTS?.pinnedAutorouterSourceDir ?? ''
+const PREPARE_HOME_SCRIPT = PRIVATE_RC_INPUTS?.prepareHomeScript ?? ''
+const EVIDENCE_DIR = PRIVATE_RC_INPUTS?.evidenceDir ?? path.resolve(RC_ROOT, 'artifacts', 'autorouter-private-rc-e2e-skip')
 const MOCK_REPLY = 'Dispatch 158 mock reply: routed conversation completed.'
 const APP_PATTERN = /^Hermes Agent [0-9a-f]{7}\.app$/
+
+function skipIfInputsMissing(): void {
+  test.skip(!!SKIP_REASON, SKIP_REASON ?? 'private RC inputs unavailable')
+}
+
+function requirePrivateRcInputs() {
+  if (!PRIVATE_RC_INPUTS) throw new Error(MISSING_PRIVATE_RC_INPUTS || 'private RC inputs unavailable')
+  return PRIVATE_RC_INPUTS
+}
 
 interface MockRequest {
   method: string
@@ -64,6 +88,7 @@ function startSimpleMock(opts?: { chatStatus?: number; chatDelayMs?: number; cha
     if (method === 'GET' && url === '/v1/models') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ object: 'list', data: [
+        { id: 'mockinfra-baseline-model', object: 'model', created: 0, owned_by: 'mock' },
         { id: 'mockinfra-free-model', object: 'model', created: 0, owned_by: 'mock' },
         { id: 'mockinfra-no-tools-model', object: 'model', created: 0, owned_by: 'mock' },
         { id: 'mockinfra-unknown-cost-model', object: 'model', created: 0, owned_by: 'mock' },
@@ -297,6 +322,27 @@ function summarizeMock(mock: SimpleMock) {
   }
 }
 
+function collectAutorouterPluginArtifacts(sandboxRoot: string, label: string): Record<string, any> {
+  const dir = path.join(sandboxRoot, 'hermes-home', 'plugin-data', 'autorouter')
+  const out: Record<string, any> = { dir, files: {} as Record<string, any> }
+  try {
+    if (fs.existsSync(dir)) {
+      for (const name of fs.readdirSync(dir)) {
+        const p = path.join(dir, name)
+        try {
+          const stat = fs.statSync(p)
+          if (stat.isDirectory()) continue
+          if (name.endsWith('.json')) out.files[name] = readJsonIfExists(p)
+          else if (stat.size < 200_000) out.files[name] = readTextIfExists(p)
+          else out.files[name] = { size: stat.size }
+        } catch {}
+      }
+    }
+  } catch {}
+  saveEvidence(`${label}-autorouter-plugin-data.json`, out)
+  return out
+}
+
 function collectEgressEvidence(mock: SimpleMock, sandboxRoot: string, label: string) {
   const summary = summarizeMock(mock)
   // This server can prove what it received, not that the process made no
@@ -373,7 +419,7 @@ async function runPhysicalProviderErrorCase(args: {
   } catch {}
   if (!sawReply) {
     await expectUiErrorOrRefusal(fixture.page, args.timeoutMs ?? 180_000).catch(async () => {
-      await takeEvidenceScreenshot(fixture.page, `${args.label}-no-error-text.png`).catch(() => null)
+      await takeEvidenceScreenshot(fixture!.page, `${args.label}-no-error-text.png`).catch(() => null)
     })
   }
   await fixture.page.waitForTimeout(3000)
@@ -407,8 +453,8 @@ async function runPhysicalProviderErrorCase(args: {
   })
 
   test('manual AutoRouter desktop E2E: UI picker selection routes to physical mock model and transcript completes', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     mock = await startSimpleMock()
 
     fixture = await setupPackagedAppRealBackend({
@@ -439,8 +485,8 @@ async function runPhysicalProviderErrorCase(args: {
   })
 
   test('ordinary-session native routing (Mode B): routes without virtual picker selection; explicit physical authority preserved', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     mock = await startSimpleMock()
 
     fixture = await setupPackagedAppRealBackend({
@@ -471,12 +517,94 @@ async function runPhysicalProviderErrorCase(args: {
 
     saveEvidence('modeb-mock-requests.json', chatReqs.map(r => ({ model: r.model, path: r.path, at: r.at })))
     saveEvidence('modeb-native-routing-state.json', marker)
+    collectAutorouterPluginArtifacts(fixture.sandbox.root, 'modeb')
     collectEgressEvidence(mock, fixture.sandbox.root, 'modeb')
   })
 
+  test('Mode B differential: native routing disabled sends baseline wire model; enabled sends autorouter-selected wire model', async () => {
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
+
+    // Phase 1: native routing disabled -> baseline model on wire
+    mock = await startSimpleMock()
+    fixture = await setupPackagedAppRealBackend({
+      appPattern: APP_PATTERN,
+      sandboxPrefix: 'autorouter-modeb-diff-off',
+      prepareSandbox: (sandbox) => {
+        prepareHome(sandbox.hermesHome, mock!.url, {
+          chatRouter: false,
+          nativeRouting: false,
+          defaultProvider: 'mockinfra',
+          defaultModel: 'mockinfra-baseline-model',
+        })
+      },
+      env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic' },
+    })
+    await waitForComposerReady(fixture, 240_000)
+    await pageReadySettled(fixture.page)
+    await sendChatAndExpectReply(fixture.page, 'Dispatch 159 Mode B differential baseline (routing off)', 240_000)
+    const offReqs = mock.requests.filter((r) => r.path.startsWith('/v1/chat/completions'))
+    expect(offReqs.length).toBeGreaterThan(0)
+    expect(offReqs.every((r) => r.model === 'mockinfra-baseline-model')).toBeTruthy()
+    assertNoVirtualModelOnWire(mock)
+    saveEvidence('modeb-diff-off-mock-requests.json', offReqs.map(r => ({ model: r.model, path: r.path, at: r.at })))
+    saveEvidence('modeb-diff-off-native-routing-state.json', readJsonIfExists(path.join(fixture.sandbox.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json')) || {})
+    collectAutorouterPluginArtifacts(fixture.sandbox.root, 'modeb-diff-off')
+    collectEgressEvidence(mock, fixture.sandbox.root, 'modeb-diff-off')
+    await fixture.cleanup().catch(() => undefined)
+    fixture = null
+    await mock.close().catch(() => undefined)
+    mock = null
+
+    // Phase 2: native routing enabled -> autorouter-selected free model on wire (different from baseline)
+    mock = await startSimpleMock()
+    fixture = await setupPackagedAppRealBackend({
+      appPattern: APP_PATTERN,
+      sandboxPrefix: 'autorouter-modeb-diff-on',
+      prepareSandbox: (sandbox) => {
+        prepareHome(sandbox.hermesHome, mock!.url, {
+          chatRouter: false,
+          nativeRouting: true,
+          defaultProvider: 'mockinfra',
+          defaultModel: 'mockinfra-baseline-model',
+        })
+      },
+      env: { HERMES_DISABLE_LAZY_INSTALLS: '1', MOCKINFRA_API_KEY: 'fixture-mockinfra-key-synthetic' },
+    })
+    await waitForComposerReady(fixture, 240_000)
+    await pageReadySettled(fixture.page)
+    await sendChatAndExpectReply(fixture.page, 'Dispatch 159 Mode B differential routed (routing on)', 240_000)
+    const onReqs = mock.requests.filter((r) => r.path.startsWith('/v1/chat/completions'))
+    expect(onReqs.length).toBeGreaterThan(0)
+    assertNoVirtualModelOnWire(mock)
+    expect(onReqs.some((r) => r.model === 'mockinfra-free-model')).toBeTruthy()
+    expect(onReqs.every((r) => r.model !== 'mockinfra-baseline-model')).toBeTruthy()
+    const marker = readJsonIfExists(path.join(fixture.sandbox.hermesHome, 'plugin-data', 'autorouter', 'native-routing-state.json'))
+    saveEvidence('modeb-diff-on-mock-requests.json', onReqs.map(r => ({ model: r.model, path: r.path, at: r.at })))
+    saveEvidence('modeb-diff-on-native-routing-state.json', marker || {})
+    expect(marker).toBeTruthy()
+    expect(marker.enable_native_routing).toBe(true)
+    expect(marker.host_supported).toBe(true)
+    // Middleware invocation proof: observed outgoing wire model differs from configured baseline only when routing enabled,
+    // and autorouter plugin-data artifacts/state for the routed run are captured for receipt/binding inspection.
+    const onArtifacts = collectAutorouterPluginArtifacts(fixture.sandbox.root, 'modeb-diff-on')
+    collectEgressEvidence(mock, fixture.sandbox.root, 'modeb-diff-on')
+    saveEvidence('modeb-diff-summary.json', {
+      baselineWireModelWhenDisabled: offReqs.map(r => r.model),
+      routedWireModelWhenEnabled: onReqs.map(r => r.model),
+      configuredBaselineModel: 'mockinfra-baseline-model',
+      expectedRoutedModel: 'mockinfra-free-model',
+      middlewareInvocationEvidence: {
+        wireModelChangedFromBaseline: onReqs.every(r => r.model !== 'mockinfra-baseline-model') && offReqs.every(r => r.model === 'mockinfra-baseline-model'),
+        nativeRoutingState: marker,
+        pluginDataFiles: Object.keys(onArtifacts.files || {}),
+      },
+    })
+  })
+
   test('disable native routing returns normal behavior (no autorouter interception)', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     mock = await startSimpleMock()
 
     fixture = await setupPackagedAppRealBackend({
@@ -503,8 +631,8 @@ async function runPhysicalProviderErrorCase(args: {
   })
 
   test('zero-outbound refusal (Mode B, no eligible free route): UI shows refusal and mock receives no chat completion', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     mock = await startSimpleMock()
 
     fixture = await setupPackagedAppRealBackend({
@@ -534,8 +662,8 @@ async function runPhysicalProviderErrorCase(args: {
   })
 
   test('HTTP 429 from physical provider: no virtual model on wire and UI surfaces provider error', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     mock = await startSimpleMock({ chatStatus: 429, chatBody: { error: { message: 'Rate limit exceeded (mock)', type: 'rate_limit_error', code: 'rate_limit' } } })
 
     fixture = await setupPackagedAppRealBackend({
@@ -559,7 +687,7 @@ async function runPhysicalProviderErrorCase(args: {
     } catch {}
     if (!sawReply) {
       await expectUiErrorOrRefusal(fixture.page, 180_000).catch(async () => {
-        await takeEvidenceScreenshot(fixture.page, 'http429-no-error-text.png').catch(() => null)
+        await takeEvidenceScreenshot(fixture!.page, 'http429-no-error-text.png').catch(() => null)
       })
     }
     await fixture.page.waitForTimeout(2000)
@@ -584,8 +712,8 @@ async function runPhysicalProviderErrorCase(args: {
   })
 
   test('AutoRouter picker unavailable when chat router disabled (actionability gate, Desktop UI)', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     mock = await startSimpleMock()
 
     fixture = await setupPackagedAppRealBackend({
@@ -607,8 +735,8 @@ async function runPhysicalProviderErrorCase(args: {
 
 
   test('HTTP 500 from physical provider: no virtual model on wire and UI surfaces provider error', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     mock = await startSimpleMock({ chatStatus: 500, chatBody: { error: { message: 'Internal server error (mock)', type: 'server_error', code: 'internal_error' } } })
 
     fixture = await setupPackagedAppRealBackend({
@@ -631,7 +759,7 @@ async function runPhysicalProviderErrorCase(args: {
     } catch {}
     if (!sawReply) {
       await expectUiErrorOrRefusal(fixture.page, 180_000).catch(async () => {
-        await takeEvidenceScreenshot(fixture.page, 'http500-no-error-text.png').catch(() => null)
+        await takeEvidenceScreenshot(fixture!.page, 'http500-no-error-text.png').catch(() => null)
       })
     }
     await fixture.page.waitForTimeout(3000)
@@ -656,8 +784,8 @@ async function runPhysicalProviderErrorCase(args: {
   })
 
   test('no eligible route when required tools unsupported (ineligible model): refusal with zero outbound', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     mock = await startSimpleMock()
 
     fixture = await setupPackagedAppRealBackend({
@@ -686,8 +814,8 @@ async function runPhysicalProviderErrorCase(args: {
   })
 
   test('HTTP 401 from physical provider: no virtual model on wire and UI surfaces provider error', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     await runPhysicalProviderErrorCase({
       name: 'HTTP 401',
       label: 'http401',
@@ -697,8 +825,8 @@ async function runPhysicalProviderErrorCase(args: {
   })
 
   test('HTTP 403 from physical provider: no virtual model on wire and UI surfaces provider error', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     await runPhysicalProviderErrorCase({
       name: 'HTTP 403',
       label: 'http403',
@@ -708,8 +836,8 @@ async function runPhysicalProviderErrorCase(args: {
   })
 
   test('transport failure from physical provider (connection reset): no virtual model on wire and UI surfaces error', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     await runPhysicalProviderErrorCase({
       name: 'transport failure',
       label: 'transport-reset',
@@ -720,8 +848,8 @@ async function runPhysicalProviderErrorCase(args: {
   })
 
   test('request timeout to physical provider: no virtual model on wire and UI surfaces timeout/error state', async () => {
-    test.skip(!fs.existsSync(PINNED_AUTOROUTER), 'pinned AutoRouter snapshot missing')
-    test.skip(!fs.existsSync(PREPARE_HOME_SCRIPT), 'prepare_autorouter_home.py missing')
+    skipIfInputsMissing()
+    requirePrivateRcInputs()
     await runPhysicalProviderErrorCase({
       name: 'request timeout',
       label: 'http-timeout',
@@ -733,14 +861,22 @@ async function runPhysicalProviderErrorCase(args: {
   })
 
   test('isolation, protocol registration skip, and sandbox evidence', async () => {
+    skipIfInputsMissing()
+    const inputs = requirePrivateRcInputs()
     const realHermesHome = path.join(os.homedir(), '.hermes')
     saveEvidence('isolation-check.json', {
       realHermesHome,
       note: 'Each packaged E2E run uses a disposable sandbox HERMES_HOME and electron user data; protocol registration skipped via HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION=1; real backend fixture does not pass --no-sandbox; lazy installs disabled; mock provider on 127.0.0.1 with synthetic credentials only.',
       fixture: 'setupPackagedAppRealBackend',
+      privateRcMode: PRIVATE_RC_MODE,
+      pinnedSha: inputs.pinnedSha,
+      pinnedArchiveSha256: inputs.archiveSha256,
+      prepareHomeScript: inputs.prepareHomeScript,
+      pinnedAutorouterSourceDir: inputs.pinnedAutorouterSourceDir,
+      evidenceDir: inputs.evidenceDir,
       checkedAt: new Date().toISOString(),
     })
-    expect(fs.existsSync(PREPARE_HOME_SCRIPT)).toBeTruthy()
-    expect(fs.existsSync(PINNED_AUTOROUTER)).toBeTruthy()
+    expect(fs.existsSync(inputs.prepareHomeScript)).toBeTruthy()
+    expect(fs.existsSync(inputs.pinnedAutorouterSourceDir)).toBeTruthy()
   })
 })
