@@ -309,3 +309,15 @@ def test_api_admission_without_requested_route_remains_mode_b_eligible(tmp_path)
 @pytest.mark.parametrize("settings", [{"route": "unexpected"}, {"requested_model": 42}, "not-a-dict"])
 def test_malformed_api_route_authority_is_not_rewritten(settings):
     assert mod.api_turn_has_explicit_route_authority(settings) is True
+
+
+@pytest.mark.parametrize("bad_request", [
+    {"source": "cli", "model": ["not-a-model"]},
+    {"source": "cli", "provider": 12},
+    {"source": "cli", "base_url": {"url": "http://example.invalid"}},
+    {"source": "cli", "model_requested": True},
+])
+def test_malformed_persisted_route_field_cannot_authorize_mode_b_rewrite(bad_request):
+    raw = json.dumps(bad_request)
+    assert mod.request_route_authority(raw) == "unavailable"
+    assert mod.has_explicit_request_route(raw) is True
