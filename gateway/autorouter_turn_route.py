@@ -42,6 +42,12 @@ def request_route_authority(request_json: str | None) -> str:
     if not isinstance(req, dict):
         return "unavailable"
 
+    # A persisted request that names a route field with an unexpected type
+    # has unknown authority. Do not mistake corruption for an ordinary turn.
+    for field in ("model", "provider", "model_requested", "base_url"):
+        value = req.get(field)
+        if value is not None and not isinstance(value, str):
+            return "unavailable"
     model = req.get("model")
     provider = req.get("provider")
     model_requested = req.get("model_requested")
@@ -195,8 +201,19 @@ def resolve_autorouter_virtual_turn(
     resolved_kwargs["requested_provider"] = (
         physical_runtime.get("requested_provider") or receipt.get("provider") or resolved_kwargs.get("requested_provider")
     )
-    resolved_model = receipt.get("model") or physical_runtime.get("model") or model
-    return str(resolved_model), resolved_kwargs
+    resolved_model = receipt.get("model") or physical_runtime.get("model")
+    resolved_provider = resolved_kwargs.get("provider")
+    # Never fall back to the ORIGINAL virtual model identifier. A malformed
+    # consumer/receipt must refuse before constructing an inference client.
+    if (
+        not isinstance(resolved_model, str)
+        or not resolved_model.strip()
+        or not isinstance(resolved_provider, str)
+        or not resolved_provider.strip()
+        or is_autorouter_pick(resolved_model, resolved_provider)
+    ):
+        raise RuntimeError("AutoRouter selection refused before provider request: incomplete physical route")
+    return resolved_model.strip(), resolved_kwargs
 
 
 def apply_pre_inference_route_turn(
