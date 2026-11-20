@@ -1197,8 +1197,6 @@ async function runPhysicalProviderErrorCase(args: {
     await openModelPickerUi(fixture.page)
     const input = fixture.page.locator('input[placeholder*="Search" i], [cmdk-input], [role="combobox"], input[type="search"]').first()
     await expect(input).toBeVisible({ timeout: 20_000 })
-    const dialog = fixture.page.locator('[role="dialog"], [cmdk-root], [cmdk-overlay], [role="listbox"], [data-slot="popover-content"]').first()
-
     // A visible label is NOT a screen-reader accessible option. The composer
     // menu uses a Radix menuitem; other hosts can present a Command option.
     // Require the accessible role AND accessible name in either supported host.
