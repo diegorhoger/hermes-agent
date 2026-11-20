@@ -22,22 +22,12 @@ def _bounded(value: Any, limit: int) -> str:
 
 def _runtime_to_kwargs(runtime: dict[str, Any], *, fallback_provider: str | None = None) -> dict[str, Any]:
     """Convert a resolved runtime/provider record into gateway agent kwargs."""
-    try:
-        from gateway.run import _runtime_agent_kwargs
+    # The shared gateway converter is the only supported constructor boundary.
+    # If it rejects malformed runtime data, do not silently pass through raw
+    # provider fields or widen the credential/endpoint authority.
+    from gateway.run import _runtime_agent_kwargs
 
-        kwargs = _runtime_agent_kwargs(dict(runtime))
-    except Exception:
-        # Fallback: pass through common runtime fields.
-        kwargs = {
-            k: runtime.get(k)
-            for k in (
-                "api_key", "base_url", "provider", "requested_provider", "api_mode",
-                "command", "args", "credential_pool", "max_tokens", "capabilities",
-                "request_overrides",
-            )
-        }
-        kwargs["args"] = list(kwargs.get("args") or [])
-        kwargs["capabilities"] = dict(kwargs.get("capabilities") or {})
+    kwargs = _runtime_agent_kwargs(dict(runtime))
     provider = runtime.get("provider") or fallback_provider
     if provider:
         kwargs["provider"] = provider
