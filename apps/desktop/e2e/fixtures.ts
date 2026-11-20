@@ -459,19 +459,76 @@ export async function setupDeadBackend(options: DeadBackendOptions = {}): Promis
 /**
  * Resolve the packaged Electron binary path, per-platform, matching
  * electron-builder's output layout under release/.
+ *
+ * For commit-specific private RC builds (e.g. "Hermes Agent d38d981.app"),
+ * pass `appName` / `binaryName` or let `resolvePackagedPrivateRcBinaryPath`
+ * discover the matching app bundle.
  */
-function resolvePackagedBinaryPath(): string {
+export function resolvePackagedBinaryPath(options?: { appName?: string; binaryName?: string }): string {
+  const appName = options?.appName
+  const binaryName = options?.binaryName
+
   if (process.platform === 'win32') {
-    return path.join(RELEASE_ROOT, 'win-unpacked', 'Hermes.exe')
+    return path.join(RELEASE_ROOT, 'win-unpacked', binaryName ?? appName ?? 'Hermes.exe')
   }
 
   if (process.platform === 'darwin') {
     const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
+    const appBundle = appName ?? 'Hermes.app'
+    const execName = binaryName ?? appName?.replace(/\.app$/, '') ?? 'Hermes'
 
-    return path.join(RELEASE_ROOT, `mac-${arch}`, 'Hermes.app', 'Contents', 'MacOS', 'Hermes')
+    return path.join(RELEASE_ROOT, `mac-${arch}`, appBundle, 'Contents', 'MacOS', execName)
   }
 
-  return path.join(RELEASE_ROOT, 'linux-unpacked', 'hermes')
+  return path.join(RELEASE_ROOT, 'linux-unpacked', binaryName ?? appName ?? 'hermes')
+}
+
+/**
+ * Find a packaged macOS app bundle in `release/mac-<arch>/` whose name matches
+ * the predicate (default: any `Hermes*.app`, preferring commit-specific ones).
+ * Returns the resolved executable path inside `Contents/MacOS/`, or null.
+ */
+export function resolvePackagedPrivateRcBinaryPath(opts?: {
+  appPattern?: RegExp
+  releaseDir?: string
+}): string | null {
+  if (process.platform !== 'darwin') {
+    return null
+  }
+
+  const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
+  const dir = opts?.releaseDir ?? path.join(RELEASE_ROOT, `mac-${arch}`)
+  const pattern = opts?.appPattern ?? /^Hermes.*\.app$/
+
+  let entries: string[]
+  try {
+    entries = fs.readdirSync(dir)
+  } catch {
+    return null
+  }
+
+  const matches = entries
+    .filter((name) => pattern.test(name) && fs.statSync(path.join(dir, name)).isDirectory())
+    .sort((a, b) => b.length - a.length || b.localeCompare(a))
+
+  for (const appBundle of matches) {
+    const macOsDir = path.join(dir, appBundle, 'Contents', 'MacOS')
+    try {
+      const bins = fs.readdirSync(macOsDir).filter((name) => !name.startsWith('.'))
+      const preferred = appBundle.replace(/\.app$/, '')
+      const exec = bins.includes(preferred) ? preferred : bins[0]
+      if (exec) {
+        const full = path.join(macOsDir, exec)
+        if (fs.existsSync(full)) {
+          return full
+        }
+      }
+    } catch {
+      // continue
+    }
+  }
+
+  return null
 }
 
 export const PACKAGED_BINARY_PATH = resolvePackagedBinaryPath()
@@ -484,6 +541,7 @@ export interface PackagedAppFixture {
   app: ElectronApplication
   page: Page
   sandbox: Sandbox
+  executablePath: string
   cleanup: () => Promise<void>
 }
 
@@ -533,6 +591,82 @@ export async function setupPackagedApp(): Promise<PackagedAppFixture> {
     app,
     page,
     sandbox,
+    executablePath: PACKAGED_BINARY_PATH,
+    cleanup: async () => {
+      await app.close().catch(() => undefined)
+      sandbox.cleanup()
+    },
+  }
+}
+
+export interface PackagedRealBackendOptions {
+  /** Explicit executable path inside the packaged app bundle. */
+  executablePath?: string
+  /** App bundle name or discovery pattern for commit-specific private RC builds. */
+  appPattern?: RegExp
+  /** Extra env vars (merged after sandbox defaults; do not set BOOT_FAKE). */
+  env?: Record<string, string>
+  /** Optional pre-launch hook to prepare the sandbox HERMES_HOME/user data. */
+  prepareSandbox?: (sandbox: Sandbox) => Promise<void> | void
+  sandboxPrefix?: string
+}
+
+/**
+ * Launch a packaged Electron binary with its REAL embedded backend (no fake
+ * boot), preserving the Electron sandbox (no --no-sandbox). Intended for
+ * private-RC acceptance where the bundled hermes backend must run against an
+ * isolated, preconfigured HERMES_HOME and localhost-only mock inference.
+ *
+ * Keeps `setupPackagedApp()` unchanged for existing fake-boot tests.
+ */
+export async function setupPackagedAppRealBackend(
+  options: PackagedRealBackendOptions = {},
+): Promise<PackagedAppFixture> {
+  const executablePath =
+    options.executablePath ?? resolvePackagedPrivateRcBinaryPath({ appPattern: options.appPattern })
+
+  if (!executablePath || !fs.existsSync(executablePath)) {
+    throw new Error(
+      `Packaged app binary not found for real-backend E2E. Searched: ${executablePath ?? '(none)'}. ` +
+        'Provide executablePath/appPattern or ensure a packaged app exists under release/.',
+    )
+  }
+
+  const sandbox = createSandbox(options.sandboxPrefix ?? 'packaged-real')
+
+  if (options.prepareSandbox) {
+    await options.prepareSandbox(sandbox)
+  }
+
+  const env = buildAppEnv(sandbox, {
+    HERMES_DESKTOP_ISOLATED_BACKEND: '1',
+    HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION: '1',
+    HERMES_DISABLE_LAZY_INSTALLS: '1',
+    ...options.env,
+  })
+
+  // Packaged binary uses its own bundled renderer/runtime, not the dev checkout.
+  delete (env as Record<string, string | undefined>).HERMES_DESKTOP_DEV_SERVER
+  delete (env as Record<string, string | undefined>).HERMES_DESKTOP_HERMES
+  delete (env as Record<string, string | undefined>).HERMES_DESKTOP_HERMES_ROOT
+  delete (env as Record<string, string | undefined>).HERMES_DESKTOP_BOOT_FAKE
+  delete (env as Record<string, string | undefined>).HERMES_DESKTOP_BOOT_FAKE_ERROR
+  delete (env as Record<string, string | undefined>).HERMES_DESKTOP_BOOT_FAKE_STEP_MS
+
+  const app = await _electron.launch({
+    executablePath,
+    args: ['--disable-gpu'],
+    env,
+  })
+
+  const page = await app.firstWindow()
+  installErrorBannerGuard(page)
+
+  return {
+    app,
+    page,
+    sandbox,
+    executablePath,
     cleanup: async () => {
       await app.close().catch(() => undefined)
       sandbox.cleanup()
