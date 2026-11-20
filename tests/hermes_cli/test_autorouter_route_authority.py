@@ -260,3 +260,52 @@ def test_malformed_authority_never_rewrites_route(tmp_path, monkeypatch):
     assert model == BASELINE_MODEL
     assert kwargs["provider"] == BASELINE_PROVIDER
     assert kwargs["base_url"] == BASELINE_URL
+
+
+# --- API admission requested-route precedence -------------------------------
+
+@pytest.mark.parametrize("settings", [
+    {"requested_model": "api-explicit-model"},
+    {"requested_provider": "api-explicit-provider"},
+    {"route": {"provider": "api-provider", "model": "api-model"}},
+    {"session_model": "api-session-model"},
+    {"requested_runtime": {"provider": "api-provider"}},
+    {"confirmed_runtime_lock": True},
+])
+def test_api_admission_route_authority_prevents_mode_b_override(tmp_path, monkeypatch, settings):
+    """An API request route is separate from session.create request_json."""
+    _install_routing_mocks(monkeypatch)
+    p = _policy(tmp_path)
+    has_explicit = mod.turn_has_explicit_route_authority(
+        request_json=p.request_json, api_settings=settings,
+    )
+    assert has_explicit is True
+    model, runtime = mod.resolve_autorouter_for_gateway_turn(
+        model=BASELINE_MODEL,
+        runtime_kwargs={"provider": BASELINE_PROVIDER, "base_url": BASELINE_URL},
+        session_id="api-sess-160",
+        session_key="api-key-160",
+        platform="gateway",
+        has_explicit_model_or_provider=has_explicit,
+    )
+    assert model == BASELINE_MODEL
+    assert runtime["provider"] == BASELINE_PROVIDER
+    assert runtime["base_url"] == BASELINE_URL
+
+
+def test_api_admission_without_requested_route_remains_mode_b_eligible(tmp_path):
+    p = _policy(tmp_path)
+    settings = {
+        "requested_model": None, "requested_provider": None,
+        "route": None, "session_model": None, "requested_runtime": None,
+        "confirmed_runtime_lock": False, "model_options": {},
+    }
+    assert mod.turn_has_explicit_route_authority(
+        request_json=p.request_json, api_settings=settings,
+    ) is False
+    assert mod.api_turn_has_explicit_route_authority({"requested_provider": "auto"}) is False
+
+
+@pytest.mark.parametrize("settings", [{"route": "unexpected"}, {"requested_model": 42}, "not-a-dict"])
+def test_malformed_api_route_authority_is_not_rewritten(settings):
+    assert mod.api_turn_has_explicit_route_authority(settings) is True
