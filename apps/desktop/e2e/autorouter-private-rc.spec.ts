@@ -267,23 +267,67 @@ async function assertAutoRouterNotActionableInPicker(page: Page): Promise<void> 
 
 async function selectModelByVisibleText(page: Page, text: string): Promise<void> {
   await openModelPickerUi(page)
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const item = page.getByText(text, { exact: false }).first()
-    if (await item.isVisible().catch(() => false)) {
-      await item.click({ timeout: 15_000 })
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+  const wanted = norm(text)
+  const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const tryClick = async (loc: any): Promise<boolean> => {
+    try {
+      if (!(await loc.isVisible().catch(() => false))) return false
+      // Avoid toggling favorite/star controls inside model rows.
+      await loc.click({ timeout: 15_000 })
       await page.waitForTimeout(700)
-      return
+      // Dismiss picker/menu if still covering composer.
+      await page.keyboard.press('Escape').catch(() => undefined)
+      await page.waitForTimeout(300)
+      return true
+    } catch {
+      return false
     }
+  }
+  for (let attempt = 0; attempt < 10; attempt++) {
     const search = page.locator('input[placeholder*="Search" i], input[type="search"], [cmdk-input], [role="combobox"]').first()
     if ((await search.count().catch(() => 0)) > 0 && (await search.isVisible().catch(() => false))) {
-      await search.fill(text)
-      await page.waitForTimeout(900)
-      continue
+      await search.fill(text).catch(() => undefined)
+      await page.waitForTimeout(700)
     }
-    await page.waitForTimeout(500)
+    const direct = [
+      page.locator('[role="menuitem"], [role="option"], [cmdk-item]').filter({ hasText: new RegExp(escaped, 'i') }).first(),
+      page.getByRole('menuitem', { name: new RegExp(escaped, 'i') }).first(),
+      page.getByRole('option', { name: new RegExp(escaped, 'i') }).first(),
+      page.getByText(text, { exact: false }).first(),
+    ]
+    for (const item of direct) {
+      if (await tryClick(item)) return
+    }
+    const rows = page.locator('[role="menuitem"], [role="option"], [cmdk-item]')
+    const n = await rows.count().catch(() => 0)
+    for (let i = 0; i < n; i++) {
+      const row = rows.nth(i)
+      try {
+        if (!(await row.isVisible().catch(() => false))) continue
+        const rowText = norm(await row.innerText().catch(() => ''))
+        if (!rowText || !(rowText.includes(wanted) || wanted.includes(rowText))) continue
+        // Click model label area if present to avoid favorite buttons.
+        const label = row.locator('mark, [data-slot*="label"], [class*="label"], span').filter({ hasText: /baseline|mockinfra/i }).first()
+        if ((await label.count().catch(() => 0)) > 0 && await tryClick(label)) return
+        // Fallback: click left side of row.
+        try {
+          const box = await row.boundingBox()
+          if (box) {
+            await page.mouse.click(box.x + Math.min(80, box.width / 3), box.y + box.height / 2)
+            await page.waitForTimeout(700)
+            await page.keyboard.press('Escape').catch(() => undefined)
+            await page.waitForTimeout(300)
+            return
+          }
+        } catch {}
+        if (await tryClick(row)) return
+      } catch {}
+    }
+    await page.waitForTimeout(400)
   }
-  await expect(page.getByText(text, { exact: false }).first()).toBeVisible({ timeout: 30_000 })
-  await page.getByText(text, { exact: false }).first().click({ timeout: 15_000 })
+  await page.keyboard.press('Escape').catch(() => undefined)
+  throw new Error(`Could not select model by visible text: ${text}`)
 }
 
 async function sendChat(page: Page, text: string): Promise<void> {
