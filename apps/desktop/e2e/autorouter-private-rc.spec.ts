@@ -30,7 +30,7 @@ const PREPARE_HOME_SCRIPT = path.resolve(
 )
 const EVIDENCE_DIR = path.resolve(DISPATCH_ROOT, 'artifacts/e2e-158')
 const MOCK_REPLY = 'Dispatch 158 mock reply: routed conversation completed.'
-const APP_PATTERN = /^Hermes Agent d38d981\.app$/
+const APP_PATTERN = /^Hermes Agent [0-9a-f]{7}\.app$/
 
 interface MockRequest {
   method: string
