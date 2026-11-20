@@ -1455,6 +1455,31 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # The tier stays turn-local (turn_route): one runner serves concurrent turns of every profile.
         runner._reasoning_config = reasoning_config
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+
+        # AutoRouter: resolve explicit virtual picks to physical routes, and apply
+        # ordinary-session pre-inference routing when no explicit model/provider
+        # authority is in effect. Must run before the agent is built so no virtual
+        # autorouter model ever reaches provider construction.
+        try:
+            from gateway.autorouter_turn_route import resolve_autorouter_for_gateway_turn
+            from gateway.session_cli_turn import cli_turn
+
+            _session_override = runner._session_model_override(ctx.session_key) if ctx.session_key else None
+            _one_turn_override = cli_turn(getattr(ctx, "inbound_message_id", None)).get("model_override")
+            _has_explicit = bool(_session_override) or bool(_one_turn_override) or bool(policy and getattr(policy, "model", None))
+            model, runtime_kwargs = resolve_autorouter_for_gateway_turn(
+                model=model,
+                runtime_kwargs=runtime_kwargs,
+                session_id=ctx.session_id,
+                session_key=ctx.session_key,
+                platform=platform_key or "gateway",
+                has_explicit_model_or_provider=_has_explicit,
+            )
+        except Exception:
+            # Preserve fail-closed behavior from the resolver (it raises RuntimeError with
+            # a user-safe refusal reason). Re-raise so the turn fails before any provider request.
+            raise
+
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs, tier=service_tier)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
