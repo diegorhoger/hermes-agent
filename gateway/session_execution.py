@@ -53,11 +53,14 @@ def _resolve_autorouter_turn_route(turn_route: dict, *, session_id: str, platfor
     # (provider/credential/endpoint/api_mode). Carry it through verbatim —
     # never forward the virtual marker's placeholder endpoint or key, and
     # never invent kwargs the gateway AIAgent does not accept.
-    physical = {key: value for key, value in physical.items() if key != "model"}
+    # ``source`` and ``model`` are provenance/bookkeeping fields on the marker
+    # and resolver runtimes, not AIAgent constructor parameters.
+    runtime = {key: value for key, value in runtime.items() if key != "source"}
+    physical = {key: value for key, value in physical.items() if key not in ("model", "source")}
     return {
         **turn_route,
         "model": receipt["model"],
-        "runtime": {**runtime, **physical, "source": "autorouter-physical"},
+        "runtime": {**runtime, **physical},
     }
 
 

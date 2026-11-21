@@ -704,8 +704,11 @@ def test_gateway_turn_resolves_virtual_pin_before_agent_build(host):
     out = _resolve_autorouter_turn_route(route, session_id="sess-gw", platform="gateway")
     assert out["model"] == "nvidia/nemotron-free"
     assert out["runtime"]["provider"] == "nvidia"
-    assert out["runtime"]["source"] == "autorouter-physical"
     assert out["session_marker"] == "preserve-unrelated-fields"
+    from run_agent import AIAgent
+    import inspect
+    accepted = set(inspect.signature(AIAgent.__init__).parameters)
+    assert set(out["runtime"]).issubset(accepted), set(out["runtime"]) - accepted
     # The credential-free virtual marker never reaches the physical runtime,
     # and no unsupported AIAgent kwargs are introduced by the rewrite.
     assert "autorouter://local" not in str(out["runtime"])
@@ -713,6 +716,7 @@ def test_gateway_turn_resolves_virtual_pin_before_agent_build(host):
     assert "runtime_capabilities" not in out["runtime"]
     assert "model_info" not in out["runtime"]
     assert "model" not in out["runtime"]
+    assert "source" not in out["runtime"]
 
 
 def test_gateway_turn_leaves_explicit_physical_route_unchanged(host):
