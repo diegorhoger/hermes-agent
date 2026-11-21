@@ -30,6 +30,42 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
+def _resolve_autorouter_turn_route(turn_route: dict, *, session_id: str, platform: str = "gateway") -> dict:
+    """Resolve a persisted virtual Auto (Free) pin to this session's physical route.
+
+    The Desktop/TUI picker persists a credential-free virtual marker so resume
+    stays independent of the physical route. The gateway turn path builds its
+    AIAgent directly from that persisted route, so it must re-resolve the
+    marker through the registered pre-inference consumer BEFORE the agent cache
+    signature and client construction. A virtual identifier must never reach
+    the wire; ``resolve_autorouter_physical`` fails closed when the consumer
+    cannot produce a usable physical route.
+
+    Non-AutoRouter routes are returned byte-identical (stock behavior).
+    """
+    from hermes_cli.autorouter_picker import is_autorouter_pick, resolve_autorouter_physical
+
+    runtime = turn_route.get("runtime") or {}
+    if not is_autorouter_pick(turn_route.get("model"), runtime.get("provider")):
+        return turn_route
+    physical, receipt = resolve_autorouter_physical(session_id=session_id, platform=platform)
+    return {
+        **turn_route,
+        "model": receipt["model"],
+        "runtime": {
+            **runtime,
+            "provider": receipt["provider"],
+            "api_key": physical.get("api_key") or "",
+            "base_url": physical.get("base_url") or "",
+            "api_mode": physical.get("api_mode") or "",
+            "capabilities": None,
+            "runtime_capabilities": None,
+            "model_info": None,
+            "source": "autorouter-physical",
+        },
+    }
+
+
 class GatewaySessionAgentMixin:
     # ── agent resolution (cache reuse vs fresh build) ───────────────────────────────────────
 
@@ -197,6 +233,10 @@ class GatewaySessionAgentMixin:
         """Reuse this session's cached AIAgent (frozen system prompt + tool schemas → prompt cache
         hits) or build a fresh one. Returns (agent, reused_cached_agent)."""
         ctx = self._ctx
+        # Issue #116 (MODE A): resolve a persisted virtual picker pin before it
+        # reaches the cache signature or AIAgent construction. Fail closed.
+        turn_route = _resolve_autorouter_turn_route(
+            turn_route, session_id=str(getattr(ctx, "session_id", "") or ""), platform="gateway")
         runner = self._runner
         skip_context_files = self._skip_context_files(platform_key)
         sig = runner._agent_config_signature(

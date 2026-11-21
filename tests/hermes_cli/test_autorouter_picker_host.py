@@ -241,7 +241,6 @@ def test_explicit_only_filter_drops_autorouter_when_disabled(host):
 
 def test_autorouter_row_precedes_provider_catalog(host):
     host(enabled=True, chat_router=True)
-    moa = _inventory._moa_provider_row
     from hermes_cli.inventory import build_models_payload
     row = build_models_payload(_ctx(None), explicit_only=True, non_blocking_catalogs=True)
     slugs = [r.get("slug") for r in row["providers"]]
@@ -303,7 +302,6 @@ def test_plain_virtual_pick_refuses_when_unresolvable(host, monkeypatch):
 
 def test_wide_virtual_pin_is_recognized(host):
     host(enabled=True, chat_router=True)
-    monkeypatch = host  # reuse fixture signature: this test reaches through via monkeypatch below
     from tui_gateway import agent_factory
     from hermes_cli.autorouter_picker import is_autorouter_pick
     assert is_autorouter_pick("autorouter/auto-free", "autorouter")
@@ -685,3 +683,48 @@ def test_switch_back_to_physical_from_autorouter(host, monkeypatch):
     assert session["agent"].model == "gpt-5"
     assert session["agent"].runtime_capabilities["native_compaction"] is True
     assert session["model_override"]["provider"] == "openai"
+
+
+# ── gateway turn (issue #116 regression) ────────────────────────────────────
+# A Desktop/TUI picker pin is persisted as a credential-free virtual marker.
+# The gateway turn builds its AIAgent directly from the persisted route, so it
+# must re-resolve the marker through the consumer before client construction.
+# Before this repair the gateway reached agent_init's virtual-provider guard
+# and raised RuntimeError, so no ordinary session could use Auto (Free).
+
+def test_gateway_turn_resolves_virtual_pin_before_agent_build(host):
+    from gateway.session_execution import _resolve_autorouter_turn_route
+
+    host(enabled=True, chat_router=True)
+    route = {
+        "model": "auto-free",
+        "runtime": virtual_marker_runtime("autorouter"),
+        "session_marker": "preserve-unrelated-fields",
+    }
+    out = _resolve_autorouter_turn_route(route, session_id="sess-gw", platform="gateway")
+    assert out["model"] == "nvidia/nemotron-free"
+    assert out["runtime"]["provider"] == "nvidia"
+    assert out["runtime"]["source"] == "autorouter-physical"
+    assert out["session_marker"] == "preserve-unrelated-fields"
+    # The credential-free virtual marker never reaches the physical runtime.
+    assert "autorouter://local" not in str(out["runtime"])
+    assert out["runtime"]["api_key"] != "autorouter-virtual-provider"
+
+
+def test_gateway_turn_leaves_explicit_physical_route_unchanged(host):
+    from gateway.session_execution import _resolve_autorouter_turn_route
+
+    host(enabled=True, chat_router=True)
+    physical = {"model": "gemini-2.5-flash", "runtime": {"provider": "google"}}
+    assert _resolve_autorouter_turn_route(physical, session_id="sess-gw") is physical
+
+
+def test_gateway_turn_refuses_unresolvable_pin_before_network(host, monkeypatch):
+    from gateway.session_execution import _resolve_autorouter_turn_route
+
+    host(enabled=True, chat_router=True)
+    monkeypatch.setenv("FIXTURE_OUTCOME", "refuse")
+    with pytest.raises(RuntimeError, match="before any provider request"):
+        _resolve_autorouter_turn_route(
+            {"model": "auto-free", "runtime": virtual_marker_runtime("autorouter")},
+            session_id="sess-gw", platform="gateway")
