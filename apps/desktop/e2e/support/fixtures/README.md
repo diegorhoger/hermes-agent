@@ -3,9 +3,9 @@
 This directory contains the offline pinned AutoRouter plugin archive required by
 `apps/desktop/e2e/autorouter-private-rc.spec.ts` for private-RC acceptance runs.
 
-- Pinned SHA: `cdaef496501eadccdde1ac250ef1a18d5b1fd402`
-- Archive: `autorouter-pinned-cdaef496501eadccdde1ac250ef1a18d5b1fd402.tar.gz`
-- Expected SHA256: `1579cab56da7032f37e6839eb86c94d158c0e01dc7d2caf49c10df156ec5485c`
+- Pinned SHA: `8252022a309a8f4b887524174fe6351fbb225c15` (AutoRouter PR #132 merged: fail-closed host capability detection)
+- Archive: `autorouter-pinned-8252022a309a8f4b887524174fe6351fbb225c15.tar.gz`
+- Expected SHA256: `809bd0a721a6de90c54f98e7906f71df04f392495731b888553d4c32dfc46401`
 
 The harness verifies the archive hash before extracting it into a disposable
 temporary directory. Do not replace this archive without updating the expected

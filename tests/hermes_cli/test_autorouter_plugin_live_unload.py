@@ -29,7 +29,7 @@ def _archive_root() -> pathlib.Path:
 
     archive = (
         REPO / "apps" / "desktop" / "e2e" / "support" / "fixtures"
-        / "autorouter-pinned-cdaef496501eadccdde1ac250ef1a18d5b1fd402.tar.gz"
+        / "autorouter-pinned-8252022a309a8f4b887524174fe6351fbb225c15.tar.gz"
     )
     root = pathlib.Path(tempfile.mkdtemp(prefix="autorouter-live-unload-"))
     subprocess.run(["tar", "-xzf", str(archive), "-C", str(root)], check=True, capture_output=True)
