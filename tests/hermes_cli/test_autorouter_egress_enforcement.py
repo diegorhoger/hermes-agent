@@ -54,6 +54,16 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
+def _run_probe(*, profile=None, mock_port):
+    env = dict(os.environ, MOCK_PORT=str(mock_port))
+    command = (["sandbox-exec", "-f", str(profile)] if profile else []) + [sys.executable, "-c", PROBE]
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=30, env=env)
+    assert completed.returncode == 0, completed.stderr
+    line = next((l for l in completed.stdout.splitlines() if l.startswith("RESULT ")), None)
+    assert line, completed.stdout
+    return json.loads(line[len("RESULT "):])
+
+
 @pytest.mark.skipif(not shutil.which("sandbox-exec"), reason="sandbox-exec unavailable (non-macOS)")
 def test_sandbox_denies_nonloopback_and_allows_loopback(tmp_path):
     profile = tmp_path / "deny-nonloopback.sb"
@@ -63,21 +73,18 @@ def test_sandbox_denies_nonloopback_and_allows_loopback(tmp_path):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        env = dict(os.environ, MOCK_PORT=str(server.server_port))
-        completed = subprocess.run(
-            ["sandbox-exec", "-f", str(profile), sys.executable, "-c", PROBE],
-            capture_output=True, text=True, timeout=30, env=env,
-        )
+        confined = _run_probe(profile=profile, mock_port=server.server_port)
+        # Negative control: identical probe, no sandbox. It must NOT receive
+        # EPERM for the same destination, which attributes the denial to the
+        # sandbox profile rather than an unrelated host/network restriction.
+        control = _run_probe(mock_port=server.server_port)
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
 
-    assert completed.returncode == 0, completed.stderr
-    line = next((l for l in completed.stdout.splitlines() if l.startswith("RESULT ")), None)
-    assert line, completed.stdout
-    result = json.loads(line[len("RESULT "):])
-    assert result["loopback"] == "connected", result
-    # EPERM (errno 1) means the OS refused the connect, not that the host was
-    # merely unreachable (which would be a timeout or ENETUNREACH).
-    assert result["nonloopback"] == "errno=1", result
+    assert confined["loopback"] == "connected", confined
+    # EPERM (errno 1) is an OS refusal, not an unreachable host (timeout/ENETUNREACH).
+    assert confined["nonloopback"] == "errno=1", confined
+    assert control["loopback"] == "connected", control
+    assert control["nonloopback"] != "errno=1", (confined, control)
