@@ -36,7 +36,7 @@ def install_autorouter_plugin(home: Path, pinned_snapshot: Path) -> Path:
     _copytree(pinned_snapshot, plugin_dir)
     origin = {
         "source": "local-pinned-snapshot",
-        "pinned_sha": "cdaef496501eadccdde1ac250ef1a18d5b1fd402",
+        "pinned_sha": "8252022a309a8f4b887524174fe6351fbb225c15",
         "installed_at": time.time(),
     }
     (plugin_dir / ".hermes-install-origin.json").write_text(json.dumps(origin, indent=2), encoding="utf-8")

@@ -23,7 +23,7 @@ import pytest
 ARCHIVE = (
     pathlib.Path(__file__).resolve().parents[2]
     / "apps" / "desktop" / "e2e" / "support" / "fixtures"
-    / "autorouter-pinned-cdaef496501eadccdde1ac250ef1a18d5b1fd402.tar.gz"
+    / "autorouter-pinned-8252022a309a8f4b887524174fe6351fbb225c15.tar.gz"
 )
 PKG = "_autorouter_rc160"
 

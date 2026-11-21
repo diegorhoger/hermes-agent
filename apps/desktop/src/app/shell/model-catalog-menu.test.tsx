@@ -971,6 +971,30 @@ describe('the AutoRouter virtual row', () => {
     expect(select).toHaveBeenCalledWith('auto-free', 'autorouter')
   })
 
+  it('exposes the current AutoRouter pick as aria-current, not only a visual check', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          authenticated: true,
+          auth_type: 'virtual',
+          models: ['auto-free'],
+          name: 'AutoRouter',
+          slug: 'autorouter',
+          source: 'virtual',
+          total_models: 1
+        },
+        { models: ['gemini-2.5-flash'], name: 'Google', slug: 'google' }
+      ]
+    })
+
+    renderMenu({ model: 'auto-free', provider: 'autorouter' })
+
+    const auto = await screen.findByRole('menuitem', { name: /Auto \(Free\)/i })
+    expect(auto.getAttribute('aria-current')).toBe('true')
+    const other = screen.getAllByRole('menuitem', { name: /Gemini 2\.5/i })[0]
+    expect(other?.getAttribute('aria-current')).toBeNull()
+  })
+
   it('hides the AutoRouter row while a non-actionable payload omits it', async () => {
     getGlobalModelOptions.mockResolvedValue({
       providers: [{ models: ['gemini-2.5-flash'], name: 'Google', slug: 'google' }]

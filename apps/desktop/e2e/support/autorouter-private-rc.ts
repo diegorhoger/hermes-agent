@@ -4,11 +4,11 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
-export const AUTOROUTER_PINNED_SHA = 'cdaef496501eadccdde1ac250ef1a18d5b1fd402'
+export const AUTOROUTER_PINNED_SHA = '8252022a309a8f4b887524174fe6351fbb225c15'
 export const AUTOROUTER_ARCHIVE_BASENAME =
-  'autorouter-pinned-cdaef496501eadccdde1ac250ef1a18d5b1fd402.tar.gz'
+  'autorouter-pinned-8252022a309a8f4b887524174fe6351fbb225c15.tar.gz'
 export const AUTOROUTER_ARCHIVE_SHA256 =
-  '1579cab56da7032f37e6839eb86c94d158c0e01dc7d2caf49c10df156ec5485c'
+  '809bd0a721a6de90c54f98e7906f71df04f392495731b888553d4c32dfc46401'
 
 const THIS_DIR = path.resolve(import.meta.dirname)
 export const PREPARE_AUTOROUTER_HOME_SCRIPT = path.join(THIS_DIR, 'prepare_autorouter_home.py')
