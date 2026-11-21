@@ -49,20 +49,15 @@ def _resolve_autorouter_turn_route(turn_route: dict, *, session_id: str, platfor
     if not is_autorouter_pick(turn_route.get("model"), runtime.get("provider")):
         return turn_route
     physical, receipt = resolve_autorouter_physical(session_id=session_id, platform=platform)
+    # The resolver returns the physical provider's own agent-ready runtime
+    # (provider/credential/endpoint/api_mode). Carry it through verbatim —
+    # never forward the virtual marker's placeholder endpoint or key, and
+    # never invent kwargs the gateway AIAgent does not accept.
+    physical = {key: value for key, value in physical.items() if key != "model"}
     return {
         **turn_route,
         "model": receipt["model"],
-        "runtime": {
-            **runtime,
-            "provider": receipt["provider"],
-            "api_key": physical.get("api_key") or "",
-            "base_url": physical.get("base_url") or "",
-            "api_mode": physical.get("api_mode") or "",
-            "capabilities": None,
-            "runtime_capabilities": None,
-            "model_info": None,
-            "source": "autorouter-physical",
-        },
+        "runtime": {**runtime, **physical, "source": "autorouter-physical"},
     }
 
 
